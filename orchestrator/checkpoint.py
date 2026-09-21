@@ -43,6 +43,7 @@ class Checkpoint:
     review_iteration_count: int = 0
     reviewer_feedback: list[str] = field(default_factory=list)
     final_mr_url: str = ""
+    repo_id: int | None = None
 
     # ── Persistence ─────────────────────────────────────────────────────
 

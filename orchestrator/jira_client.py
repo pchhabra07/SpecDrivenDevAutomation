@@ -25,6 +25,7 @@ class TicketData:
     description: str
     acceptance_criteria: str
     labels: list[str] = field(default_factory=list)
+    components: list[str] = field(default_factory=list)
     assignee: str | None = None
     reporter: str | None = None
     status: str = ""
@@ -54,6 +55,11 @@ class JiraClient:
         summary = fields.get("summary", "")
         description = fields.get("description", "") or ""
         labels = fields.get("labels", [])
+        components = [
+            c["name"]
+            for c in fields.get("components", [])
+            if isinstance(c, dict) and "name" in c
+        ]
         assignee = (fields.get("assignee") or {}).get("displayName")
         reporter = (fields.get("reporter") or {}).get("displayName")
         status = (fields.get("status") or {}).get("name", "")
@@ -67,6 +73,7 @@ class JiraClient:
             description=description,
             acceptance_criteria=acceptance,
             labels=labels,
+            components=components,
             assignee=assignee,
             reporter=reporter,
             status=status,

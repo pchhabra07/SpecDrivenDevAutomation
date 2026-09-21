@@ -33,14 +33,10 @@ task_queue: asyncio.Queue[str] = asyncio.Queue()
 _recent_events: dict[str, float] = {}
 _DEDUP_TTL_SECONDS = 600.0  # 10 minutes
 
-# Worker state for health monitoring
-_worker_state = {
-    "status": "idle",  # "idle" | "busy"
-    "active_ticket": None,
-    "tickets_processed": 0,
-    "tickets_failed": 0,
-    "last_processed_time": None,
-}
+from orchestrator.concurrency import ConcurrentWorkerPool
+
+# Concurrent worker pool instance
+worker_pool: ConcurrentWorkerPool | None = None
 
 
 def _cleanup_old_dedup_entries() -> None:
@@ -51,48 +47,22 @@ def _cleanup_old_dedup_entries() -> None:
         del _recent_events[k]
 
 
-async def serial_worker() -> None:
-    """
-    Background worker that continuously pulls tickets from task_queue and
-    processes them one at a time (serial execution).
-    """
-    logger.info("Serial task worker started.")
-    while True:
-        ticket_id = await task_queue.get()
-        _worker_state["status"] = "busy"
-        _worker_state["active_ticket"] = ticket_id
-        logger.info("Worker picked up ticket %s from queue.", ticket_id)
-
-        try:
-            # Run the synchronous orchestrator pipeline in a thread pool
-            result = await asyncio.to_thread(run_pipeline, ticket_id)
-            if result == 0:
-                _worker_state["tickets_processed"] += 1
-                logger.info("Pipeline completed successfully for %s", ticket_id)
-            else:
-                _worker_state["tickets_failed"] += 1
-                logger.warning("Pipeline exited with status %d for %s", result, ticket_id)
-        except Exception:
-            _worker_state["tickets_failed"] += 1
-            logger.exception("Unexpected error processing %s in background worker", ticket_id)
-        finally:
-            _worker_state["status"] = "idle"
-            _worker_state["active_ticket"] = None
-            _worker_state["last_processed_time"] = time.time()
-            task_queue.task_done()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager: launch the background serial worker on startup."""
-    worker_task = asyncio.create_task(serial_worker())
-    logger.info("Webhook service initialized.")
+    """Lifecycle manager: launch the concurrent worker pool on startup."""
+    global worker_pool
+    settings = get_settings()
+    worker_pool = ConcurrentWorkerPool(
+        queue=task_queue,
+        pipeline_runner=run_pipeline,
+        max_workers=settings.max_concurrent_tickets,
+    )
+    worker_pool.start()
+    logger.info("Webhook service initialized with %d workers.", settings.max_concurrent_tickets)
     yield
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
+    if worker_pool:
+        await worker_pool.stop()
+    logger.info("Webhook service shut down.")
     logger.info("Webhook service shut down.")
 
 
@@ -213,30 +183,49 @@ async def handle_gitlab_webhook(
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Liveness and readiness probe for container orchestration."""
+    telemetry = worker_pool.telemetry if worker_pool else {
+        "status": "idle",
+        "active_tickets": [],
+        "busy_workers": 0,
+        "max_workers": 1,
+        "processed_count": 0,
+        "failed_count": 0,
+    }
     return {
         "status": "ok",
-        "worker": _worker_state["status"],
-        "active_ticket": _worker_state["active_ticket"],
+        "worker": telemetry.get("status", "idle"),
+        "busy_workers": telemetry.get("busy_workers", 0),
+        "max_workers": telemetry.get("max_workers", 1),
+        "active_tickets": telemetry.get("active_tickets", []),
         "queue_length": task_queue.qsize(),
-        "tickets_processed": _worker_state["tickets_processed"],
-        "tickets_failed": _worker_state["tickets_failed"],
+        "tickets_processed": telemetry.get("processed_count", 0),
+        "tickets_failed": telemetry.get("failed_count", 0),
     }
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
 def metrics() -> str:
     """Prometheus-compatible plain text metrics."""
+    telemetry = worker_pool.telemetry if worker_pool else {
+        "busy_workers": 0,
+        "max_workers": 1,
+        "processed_count": 0,
+        "failed_count": 0,
+    }
     return (
         "# HELP spec_dev_queue_length Number of tickets currently waiting in queue\n"
         "# TYPE spec_dev_queue_length gauge\n"
         f"spec_dev_queue_length {task_queue.qsize()}\n\n"
         "# HELP spec_dev_tickets_processed_total Total tickets successfully completed\n"
         "# TYPE spec_dev_tickets_processed_total counter\n"
-        f"spec_dev_tickets_processed_total {_worker_state['tickets_processed']}\n\n"
+        f"spec_dev_tickets_processed_total {telemetry.get('processed_count', 0)}\n\n"
         "# HELP spec_dev_tickets_failed_total Total tickets that failed or escalated\n"
         "# TYPE spec_dev_tickets_failed_total counter\n"
-        f"spec_dev_tickets_failed_total {_worker_state['tickets_failed']}\n\n"
-        "# HELP spec_dev_worker_busy Indicator if worker is actively running a pipeline\n"
-        "# TYPE spec_dev_worker_busy gauge\n"
-        f"spec_dev_worker_busy {1 if _worker_state['status'] == 'busy' else 0}\n"
+        f"spec_dev_tickets_failed_total {telemetry.get('failed_count', 0)}\n\n"
+        "# HELP spec_dev_busy_workers Number of workers actively running a pipeline\n"
+        "# TYPE spec_dev_busy_workers gauge\n"
+        f"spec_dev_busy_workers {telemetry.get('busy_workers', 0)}\n\n"
+        "# HELP spec_dev_max_workers Configured max concurrent workers\n"
+        "# TYPE spec_dev_max_workers gauge\n"
+        f"spec_dev_max_workers {telemetry.get('max_workers', 1)}\n"
     )

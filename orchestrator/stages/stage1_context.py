@@ -19,6 +19,7 @@ from orchestrator.checkpoint import Checkpoint
 from orchestrator.gitlab_client import GitLabClient
 from orchestrator.jira_client import JiraClient, TicketData
 from orchestrator.llm_client import LLMClient
+from orchestrator.repo_resolver import RepoResolver
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ def run(
     checkpoint: Checkpoint,
     audit: AuditLogger,
     qualifying_label: str,
+    repo_resolver: RepoResolver | None = None,
 ) -> TicketContext:
     """
     Execute Stage 1: fetch ticket data, enumerate repo, fetch relevant files.
@@ -113,6 +115,8 @@ def run(
         Audit log writer.
     qualifying_label : str
         The label the ticket must carry to be eligible.
+    repo_resolver : RepoResolver | None
+        Optional repository resolver for dynamic multi-repo routing (Phase 5).
 
     Returns
     -------
@@ -157,6 +161,22 @@ def run(
         raise ValueError(
             f"Ticket {ticket_id} is ineligible for automation: {disqualification_reason}"
         )
+
+    # ── Multi-repo resolution (Phase 5) ─────────────────────────────────
+    if repo_resolver:
+        default_id = gitlab.project_id or 0
+        target_repo_id = repo_resolver.resolve(ticket, default_repo_id=default_id)
+        if target_repo_id and target_repo_id != gitlab.project_id:
+            logger.info(
+                "Switching GitLab repository from %s to %s for ticket %s",
+                gitlab.project_id,
+                target_repo_id,
+                ticket_id,
+            )
+            gitlab.switch_project(target_repo_id)
+            checkpoint.repo_id = target_repo_id
+        elif gitlab.project_id:
+            checkpoint.repo_id = gitlab.project_id
 
     # ── 2. Enumerate repository file tree ───────────────────────────────
     default_branch = gitlab.get_default_branch()
@@ -218,6 +238,7 @@ def run(
             "source_file_count": len(source_files),
             "test_file_count": len(test_files),
             "total_files": len(all_paths),
+            "repo_id": checkpoint.repo_id,
         },
     )
     logger.info("Stage 1 complete for %s", ticket_id)

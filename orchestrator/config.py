@@ -129,6 +129,24 @@ class Settings(BaseSettings):
         description="HTTPS endpoint for SIEM audit log shipping when mode is 'http'",
     )
 
+    # ── Concurrency & Scaling (Phase 5) ────────────────────────────────
+    max_concurrent_tickets: int = Field(
+        2,
+        description="Number of concurrent worker tasks processing tickets in parallel",
+    )
+    repo_mapping: str = Field(
+        "{}",
+        description="JSON string mapping JIRA components/labels to GitLab project IDs",
+    )
+    enable_context_pruning: bool = Field(
+        True,
+        description="Enable automatic sliding-window pruning for long LLM transcripts",
+    )
+    max_context_tokens: int = Field(
+        16000,
+        description="Maximum estimated token threshold before older iterations are summarized",
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

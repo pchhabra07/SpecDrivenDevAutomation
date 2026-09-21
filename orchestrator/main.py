@@ -27,6 +27,7 @@ from orchestrator.gitlab_client import GitLabClient
 from orchestrator.jira_client import JiraClient
 from orchestrator.llm_client import LLMClient
 from orchestrator.rate_limiter import RateLimiter
+from orchestrator.repo_resolver import RepoResolver
 from orchestrator.stages import (
     stage1_context,
     stage2_test_gen,
@@ -93,7 +94,11 @@ def run_pipeline(
         fallback_model=settings.nim_fallback_model,
         rate_limiter=rate_limiter,
         system_prompt=_SYSTEM_PROMPT,
+        enable_context_pruning=settings.enable_context_pruning,
+        max_context_tokens=settings.max_context_tokens,
     )
+
+    repo_resolver = RepoResolver(settings.repo_mapping)
 
     audit = AuditLogger(ticket_id=ticket_id, audit_dir=settings.audit_dir)
 
@@ -105,6 +110,9 @@ def run_pipeline(
             checkpoint.current_stage,
             checkpoint.iteration_count,
         )
+        if checkpoint.repo_id and checkpoint.repo_id != gitlab.project_id:
+            logger.info("Resuming ticket in mapped repository ID %d", checkpoint.repo_id)
+            gitlab.switch_project(checkpoint.repo_id)
         if checkpoint.conversation_history:
             llm.set_history(checkpoint.conversation_history)
     else:
@@ -142,6 +150,7 @@ def run_pipeline(
                 checkpoint=checkpoint,
                 audit=audit,
                 qualifying_label=settings.qualifying_label,
+                repo_resolver=repo_resolver,
             )
             checkpoint.conversation_history = llm.history
             checkpoint.save(settings.checkpoint_dir)
@@ -158,6 +167,7 @@ def run_pipeline(
                 checkpoint=checkpoint,
                 audit=audit,
                 qualifying_label=settings.qualifying_label,
+                repo_resolver=repo_resolver,
             )
 
         # ── Stage 2: Generate Tests + Gate 1 ────────────────────────────

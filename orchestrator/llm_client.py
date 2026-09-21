@@ -22,6 +22,7 @@ from typing import Any
 
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
 
+from orchestrator.context_pruner import prune_transcript
 from orchestrator.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -41,11 +42,15 @@ class LLMClient:
         fallback_model: str,
         rate_limiter: RateLimiter,
         system_prompt: str = "",
+        enable_context_pruning: bool = False,
+        max_context_tokens: int = 16000,
     ) -> None:
         self._client = OpenAI(api_key=api_key, base_url=base_url)
         self._model = model
         self._fallback_model = fallback_model
         self._rate_limiter = rate_limiter
+        self._enable_context_pruning = enable_context_pruning
+        self._max_context_tokens = max_context_tokens
 
         self._history: list[dict[str, Any]] = []
         if system_prompt:
@@ -135,6 +140,11 @@ class LLMClient:
         temperature: float,
     ) -> dict[str, Any]:
         """Attempt the chat completion with exponential backoff."""
+        if self._enable_context_pruning:
+            self._history = prune_transcript(
+                self._history, max_tokens=self._max_context_tokens
+            )
+
         last_exc: Exception | None = None
         for attempt in range(1, _MAX_RETRIES + 1):
             self._rate_limiter.acquire()

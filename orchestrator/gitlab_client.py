@@ -52,7 +52,17 @@ class GitLabClient:
     def __init__(self, base_url: str, private_token: str, repo_id: int) -> None:
         self._gl = gitlab.Gitlab(base_url, private_token=private_token)
         self._project = self._gl.projects.get(repo_id)
-        logger.info("GitLab client initialised for project %s", self._project.path_with_namespace)
+        logger.info("GitLab client initialised for project %s", getattr(self._project, "path_with_namespace", str(repo_id)))
+
+    @property
+    def project_id(self) -> int:
+        """Return the current active project ID."""
+        return getattr(self._project, "id", None)
+
+    def switch_project(self, repo_id: int) -> None:
+        """Switch active repository/project ID."""
+        self._project = self._gl.projects.get(repo_id)
+        logger.info("GitLab client switched to project %s", getattr(self._project, "path_with_namespace", str(repo_id)))
 
     # ── Repository reads ────────────────────────────────────────────────
 

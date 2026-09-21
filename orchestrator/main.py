@@ -1,12 +1,14 @@
 """
-Orchestrator entry point — CLI-driven for Phase 1.
+Orchestrator entry point — CLI-driven (Phase 1–2).
 
-Accepts a JIRA ticket ID, runs Stage 1 (context assembly) and Stage 2
-(test generation + Gate 1 approval), and saves the checkpoint after
-each stage transition.
+Accepts a JIRA ticket ID and runs the full pipeline:
+  Stage 1: Context assembly
+  Stage 2: Test generation + Gate 1 approval
+  Stage 3: Iterative code generation + tamper-checking
+  Stage 4: Full CI/CD validation gates
 
-Phase 2 will wire in Stage 3–5.  Phase 3 will add a webhook listener
-as an alternative to the CLI trigger.
+Saves the checkpoint after each stage transition.  Phase 3 will add
+a webhook listener and Stage 5 (PR promotion + Gate 2).
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from orchestrator.gitlab_client import GitLabClient
 from orchestrator.jira_client import JiraClient
 from orchestrator.llm_client import LLMClient
 from orchestrator.rate_limiter import RateLimiter
-from orchestrator.stages import stage1_context, stage2_test_gen
+from orchestrator.stages import stage1_context, stage2_test_gen, stage3_code_gen, stage4_validation
 
 logger = logging.getLogger("orchestrator")
 
@@ -46,7 +48,7 @@ def _setup_logging(verbose: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Spec-Driven Development Pipeline — Phase 1 CLI",
+        description="Spec-Driven Development Pipeline — Phase 1–2 CLI",
     )
     parser.add_argument(
         "ticket_id",
@@ -161,16 +163,58 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint.conversation_history = llm.history
             checkpoint.save(settings.checkpoint_dir)
             logger.info(
-                "Stage 2 complete — %d test file(s) locked. "
-                "Waiting for Phase 2 (code generation) to be wired in.",
+                "Stage 2 complete — %d test file(s) locked.",
                 len(locked_tests),
             )
 
-        # ── Stages 3–5 ─────────────────────────────────────────────────
-        if checkpoint.current_stage >= 3:
+        # ── Stage 3: Iterative Code Generation ──────────────────────────
+        if checkpoint.current_stage <= 3:
+            logger.info("▶ Stage 3: Iterative Code Generation")
+            stage3_code_gen.run(
+                context=context,
+                gitlab=gitlab,
+                llm=llm,
+                jira=jira,
+                checkpoint=checkpoint,
+                audit=audit,
+                max_iterations=settings.max_code_iterations,
+                ci_poll_interval=settings.ci_poll_interval_seconds,
+                ci_timeout_minutes=settings.ci_timeout_minutes,
+                slack_webhook_url=settings.slack_webhook_url,
+                escalation_email=settings.escalation_email,
+            )
+            checkpoint.conversation_history = llm.history
+            checkpoint.save(settings.checkpoint_dir)
+            logger.info("Stage 3 complete — all target tests pass.")
+
+        # ── Stage 4: CI/CD Validation ───────────────────────────────────
+        if checkpoint.current_stage <= 4:
+            logger.info("▶ Stage 4: Full CI/CD Validation")
+            validation_result = stage4_validation.run(
+                code_branch=checkpoint.code_branch,
+                gitlab=gitlab,
+                checkpoint=checkpoint,
+                audit=audit,
+                ci_poll_interval=settings.ci_poll_interval_seconds,
+                ci_timeout_minutes=settings.ci_timeout_minutes,
+                sonar_configured=bool(settings.sonar_host_url),
+                coverage_threshold=settings.coverage_threshold,
+            )
+            checkpoint.save(settings.checkpoint_dir)
+
+            if validation_result.passed:
+                logger.info("Stage 4 complete — all validation gates passed.")
+            else:
+                logger.warning(
+                    "Stage 4 complete — validation FAILED.  "
+                    "See pipeline: %s", validation_result.pipeline_url,
+                )
+
+        # ── Stage 5 (Phase 3) ───────────────────────────────────────────
+        if checkpoint.current_stage >= 5:
             logger.info(
-                "⏸  Stages 3–5 are not yet implemented (Phase 2). "
-                "Pipeline paused at Stage %d.",
+                "⏸  Stage 5 (PR promotion + Gate 2) is not yet implemented "
+                "(Phase 3). Pipeline paused at Stage %d.",
                 checkpoint.current_stage,
             )
 

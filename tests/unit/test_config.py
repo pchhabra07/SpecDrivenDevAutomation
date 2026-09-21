@@ -53,7 +53,7 @@ class TestSettings:
         del incomplete["JIRA_API_TOKEN"]
         with patch.dict(os.environ, incomplete, clear=True):
             with pytest.raises(Exception):
-                Settings()
+                Settings(_env_file=None)
 
     def test_env_override(self):
         """Explicit env vars should override defaults."""

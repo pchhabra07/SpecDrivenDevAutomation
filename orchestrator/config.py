@@ -69,6 +69,16 @@ class Settings(BaseSettings):
         description="Minimum Jest line-coverage percentage",
     )
 
+    # ── CI/CD pipeline polling ─────────────────────────────────────────
+    ci_poll_interval_seconds: int = Field(
+        30,
+        description="Seconds between CI pipeline status polls",
+    )
+    ci_timeout_minutes: int = Field(
+        30,
+        description="Max minutes to wait for a CI pipeline run",
+    )
+
     # ── SonarQube ──────────────────────────────────────────────────────
     sonar_host_url: str = Field("", description="SonarQube server URL")
     sonar_token: str = Field("", description="SonarQube auth token")

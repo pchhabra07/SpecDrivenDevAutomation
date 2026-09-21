@@ -36,6 +36,8 @@ class Checkpoint:
     gate1_approved: bool = False
     tests_branch: str = ""
     code_branch: str = ""
+    ci_pipeline_id: int | None = None
+    validation_result: dict[str, Any] = field(default_factory=dict)
 
     # ── Persistence ─────────────────────────────────────────────────────
 

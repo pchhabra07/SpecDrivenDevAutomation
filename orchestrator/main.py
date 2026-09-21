@@ -1,14 +1,16 @@
 """
-Orchestrator entry point — CLI-driven (Phase 1–2).
+Orchestrator entry point — CLI & Webhook Server (Phase 1–4).
 
-Accepts a JIRA ticket ID and runs the full pipeline:
-  Stage 1: Context assembly
+Supports two execution modes:
+  1. CLI Mode: `python -m orchestrator.main PROJ-123`
+  2. Server Mode: `python -m orchestrator.main --server`
+
+Runs the end-to-end spec-driven pipeline:
+  Stage 1: Context assembly & qualification triage
   Stage 2: Test generation + Gate 1 approval
   Stage 3: Iterative code generation + tamper-checking
-  Stage 4: Full CI/CD validation gates
-
-Saves the checkpoint after each stage transition.  Phase 3 will add
-a webhook listener and Stage 5 (PR promotion + Gate 2).
+  Stage 4: Full CI/CD validation gates (ESLint, Semgrep, Trivy, Jest, SonarQube)
+  Stage 5: PR promotion + Gate 2 approval + reviewer feedback routing (FR-21)
 """
 
 from __future__ import annotations
@@ -16,15 +18,22 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
-from orchestrator.config import get_settings
+from orchestrator.config import Settings, get_settings
 from orchestrator.gitlab_client import GitLabClient
 from orchestrator.jira_client import JiraClient
 from orchestrator.llm_client import LLMClient
 from orchestrator.rate_limiter import RateLimiter
-from orchestrator.stages import stage1_context, stage2_test_gen, stage3_code_gen, stage4_validation
+from orchestrator.stages import (
+    stage1_context,
+    stage2_test_gen,
+    stage3_code_gen,
+    stage4_validation,
+    stage5_pr,
+)
 
 logger = logging.getLogger("orchestrator")
 
@@ -46,34 +55,23 @@ def _setup_logging(verbose: bool = False) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Spec-Driven Development Pipeline — Phase 1–2 CLI",
-    )
-    parser.add_argument(
-        "ticket_id",
-        help="JIRA ticket key to process (e.g. PROJ-123)",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable debug-level logging",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate configuration and exit without running the pipeline",
-    )
-    args = parser.parse_args(argv)
-    _setup_logging(args.verbose)
+def run_pipeline(
+    ticket_id: str,
+    dry_run: bool = False,
+    settings: Settings | None = None,
+) -> int:
+    """
+    Execute the full end-to-end Spec-Driven Development pipeline for *ticket_id*.
 
-    ticket_id: str = args.ticket_id
+    Returns 0 on success (MR promoted & approved), 1 on failure/escalation.
+    """
     logger.info("═" * 60)
     logger.info("  Spec-Driven Pipeline — Processing %s", ticket_id)
     logger.info("═" * 60)
 
-    # ── Initialise shared components ────────────────────────────────────
-    settings = get_settings()
+    if settings is None:
+        settings = get_settings()
+
     rate_limiter = RateLimiter(max_calls=settings.rate_limit_cap)
 
     jira = JiraClient(
@@ -102,22 +100,37 @@ def main(argv: list[str] | None = None) -> int:
     # ── Checkpoint: resume or create ────────────────────────────────────
     checkpoint = Checkpoint.load(ticket_id, settings.checkpoint_dir)
     if checkpoint:
-        logger.info("Resuming from checkpoint (stage=%d, iter=%d)",
-                     checkpoint.current_stage, checkpoint.iteration_count)
-        # Restore LLM conversation history from checkpoint.
+        logger.info(
+            "Resuming from checkpoint (stage=%d, iter=%d)",
+            checkpoint.current_stage,
+            checkpoint.iteration_count,
+        )
         if checkpoint.conversation_history:
             llm.set_history(checkpoint.conversation_history)
     else:
         checkpoint = Checkpoint(ticket_id=ticket_id)
         logger.info("No checkpoint found — starting fresh.")
 
-    audit.log(stage=0, event_type="pipeline_start", payload={"resumed": checkpoint.current_stage > 1})
+    audit.log(
+        stage=0,
+        event_type="pipeline_start",
+        payload={"resumed": checkpoint.current_stage > 1},
+    )
 
-    if args.dry_run:
+    if dry_run:
         logger.info("Dry-run mode — configuration validated. Exiting.")
         return 0
 
     try:
+        # Notify JIRA of pipeline start if starting fresh
+        if checkpoint.current_stage <= 1:
+            jira.transition_ticket(ticket_id, ["In Progress", "Start Progress"])
+            jira.post_lifecycle_comment(
+                ticket_id=ticket_id,
+                title="Pipeline Started",
+                message="Spec-Driven Automation pipeline has started processing this ticket.",
+            )
+
         # ── Stage 1: Assemble Context ───────────────────────────────────
         if checkpoint.current_stage <= 1:
             logger.info("▶ Stage 1: Assemble Ticket Context")
@@ -130,14 +143,13 @@ def main(argv: list[str] | None = None) -> int:
                 audit=audit,
                 qualifying_label=settings.qualifying_label,
             )
-            # Persist conversation history + checkpoint.
             checkpoint.conversation_history = llm.history
             checkpoint.save(settings.checkpoint_dir)
         else:
-            # Reconstruct context from checkpoint if we're resuming past Stage 1.
-            # In Phase 1, a full re-fetch is cheap and ensures freshness.
-            logger.info("▶ Stage 1: Re-fetching context (resuming from Stage %d)",
-                         checkpoint.current_stage)
+            logger.info(
+                "▶ Stage 1: Re-fetching context (resuming from Stage %d)",
+                checkpoint.current_stage,
+            )
             context = stage1_context.run(
                 ticket_id=ticket_id,
                 jira=jira,
@@ -167,68 +179,196 @@ def main(argv: list[str] | None = None) -> int:
                 len(locked_tests),
             )
 
-        # ── Stage 3: Iterative Code Generation ──────────────────────────
-        if checkpoint.current_stage <= 3:
-            logger.info("▶ Stage 3: Iterative Code Generation")
-            stage3_code_gen.run(
+        # ── Stages 3, 4, 5 Loop with Reviewer Feedback (FR-21) ──────────
+        while True:
+            # ── Stage 3: Iterative Code Generation ──────────────────────
+            if checkpoint.current_stage <= 3:
+                logger.info("▶ Stage 3: Iterative Code Generation")
+                stage3_code_gen.run(
+                    context=context,
+                    gitlab=gitlab,
+                    llm=llm,
+                    jira=jira,
+                    checkpoint=checkpoint,
+                    audit=audit,
+                    max_iterations=settings.max_code_iterations,
+                    ci_poll_interval=settings.ci_poll_interval_seconds,
+                    ci_timeout_minutes=settings.ci_timeout_minutes,
+                    slack_webhook_url=settings.slack_webhook_url,
+                    escalation_email=settings.escalation_email,
+                )
+                checkpoint.conversation_history = llm.history
+                checkpoint.save(settings.checkpoint_dir)
+                logger.info("Stage 3 complete — all target tests pass.")
+
+            # ── Stage 4: CI/CD Validation ───────────────────────────────
+            if checkpoint.current_stage <= 4:
+                logger.info("▶ Stage 4: Full CI/CD Validation")
+                validation_result = stage4_validation.run(
+                    code_branch=checkpoint.code_branch,
+                    gitlab=gitlab,
+                    checkpoint=checkpoint,
+                    audit=audit,
+                    ci_poll_interval=settings.ci_poll_interval_seconds,
+                    ci_timeout_minutes=settings.ci_timeout_minutes,
+                    sonar_configured=bool(settings.sonar_host_url),
+                    coverage_threshold=settings.coverage_threshold,
+                )
+                checkpoint.save(settings.checkpoint_dir)
+
+                if not validation_result.passed:
+                    logger.error(
+                        "Stage 4 validation FAILED. Pipeline halted. See %s",
+                        validation_result.pipeline_url,
+                    )
+                    return 1
+                logger.info("Stage 4 complete — all validation gates passed.")
+            else:
+                # Reconstruct validation result if resuming past Stage 4
+                validation_result = stage4_validation.ValidationResult(
+                    pipeline_id=checkpoint.ci_pipeline_id or 0,
+                    pipeline_url=checkpoint.validation_result.get("pipeline_url", ""),
+                    overall_status="passed",
+                )
+
+            # ── Stage 5: PR Promotion & Gate 2 ──────────────────────────
+            logger.info("▶ Stage 5: PR Promotion & Human Gate 2")
+            stage5_result = stage5_pr.run(
+                ticket_id=ticket_id,
                 context=context,
-                gitlab=gitlab,
-                llm=llm,
-                jira=jira,
+                validation_result=validation_result,
                 checkpoint=checkpoint,
                 audit=audit,
-                max_iterations=settings.max_code_iterations,
-                ci_poll_interval=settings.ci_poll_interval_seconds,
-                ci_timeout_minutes=settings.ci_timeout_minutes,
+                gitlab=gitlab,
+                jira=jira,
+                gate_poll_interval=settings.gate_poll_interval_seconds,
+                gate_timeout_hours=settings.gate_timeout_hours,
                 slack_webhook_url=settings.slack_webhook_url,
                 escalation_email=settings.escalation_email,
             )
-            checkpoint.conversation_history = llm.history
-            checkpoint.save(settings.checkpoint_dir)
-            logger.info("Stage 3 complete — all target tests pass.")
-
-        # ── Stage 4: CI/CD Validation ───────────────────────────────────
-        if checkpoint.current_stage <= 4:
-            logger.info("▶ Stage 4: Full CI/CD Validation")
-            validation_result = stage4_validation.run(
-                code_branch=checkpoint.code_branch,
-                gitlab=gitlab,
-                checkpoint=checkpoint,
-                audit=audit,
-                ci_poll_interval=settings.ci_poll_interval_seconds,
-                ci_timeout_minutes=settings.ci_timeout_minutes,
-                sonar_configured=bool(settings.sonar_host_url),
-                coverage_threshold=settings.coverage_threshold,
-            )
             checkpoint.save(settings.checkpoint_dir)
 
-            if validation_result.passed:
-                logger.info("Stage 4 complete — all validation gates passed.")
-            else:
-                logger.warning(
-                    "Stage 4 complete — validation FAILED.  "
-                    "See pipeline: %s", validation_result.pipeline_url,
+            if stage5_result.approved:
+                logger.info("Stage 5 complete — MR !%d approved by reviewer.", stage5_result.mr_iid)
+                break
+
+            if stage5_result.changes_requested:
+                if checkpoint.review_iteration_count >= settings.max_review_iterations:
+                    logger.warning(
+                        "Max review iterations (%d) reached for %s. Escalating to human.",
+                        settings.max_review_iterations,
+                        ticket_id,
+                    )
+                    jira.post_lifecycle_comment(
+                        ticket_id=ticket_id,
+                        title="Review Iterations Exhausted",
+                        message=(
+                            f"The automated pipeline reached the limit of "
+                            f"{settings.max_review_iterations} review iteration(s). "
+                            f"Please take over this ticket manually."
+                        ),
+                        mr_url=stage5_result.mr_url,
+                    )
+                    return 1
+
+                checkpoint.review_iteration_count += 1
+                logger.info(
+                    "Reviewer requested changes (cycle %d/%d). Re-routing to Stage 3.",
+                    checkpoint.review_iteration_count,
+                    settings.max_review_iterations,
                 )
+                feedback_prompt = (
+                    f"Reviewer feedback on MR !{checkpoint.draft_mr_iid}:\n"
+                    + "\n".join(f"- {c}" for c in stage5_result.reviewer_feedback)
+                    + "\n\nPlease modify the source code to address the reviewer's feedback. "
+                    "Do NOT modify any locked test files."
+                )
+                llm.append_user_message(feedback_prompt)
+                checkpoint.conversation_history = llm.history
+                checkpoint.current_stage = 3
+                checkpoint.save(settings.checkpoint_dir)
+                continue
 
-        # ── Stage 5 (Phase 3) ───────────────────────────────────────────
-        if checkpoint.current_stage >= 5:
-            logger.info(
-                "⏸  Stage 5 (PR promotion + Gate 2) is not yet implemented "
-                "(Phase 3). Pipeline paused at Stage %d.",
-                checkpoint.current_stage,
-            )
+            logger.error("Stage 5 ended without approval (status=%s)", stage5_result.status)
+            return 1
 
+        # ── Pipeline Complete ───────────────────────────────────────────
         audit.log(stage=0, event_type="pipeline_complete")
-        logger.info("Pipeline finished for %s.", ticket_id)
+        logger.info("Pipeline finished successfully for %s.", ticket_id)
+
+        # ── Phase 4: Audit Log Governance & Shipping ────────────────────
+        from orchestrator.audit_shipper import ship_audit_log
+        ship_result = ship_audit_log(
+            ticket_id=ticket_id,
+            audit_dir=settings.audit_dir,
+            settings=settings,
+            gitlab=gitlab,
+        )
+        logger.info("Audit log shipping result: %s", ship_result.get("status"))
+
         return 0
 
     except Exception:
         logger.exception("Pipeline failed for %s", ticket_id)
         audit.log(stage=checkpoint.current_stage, event_type="pipeline_error")
-        # Save checkpoint so we can resume after the error is resolved.
         checkpoint.conversation_history = llm.history
         checkpoint.save(settings.checkpoint_dir)
         return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Spec-Driven Development Pipeline — Orchestrator",
+    )
+    parser.add_argument(
+        "ticket_id",
+        nargs="?",
+        default=None,
+        help="JIRA ticket key to process in CLI mode (e.g. PROJ-123)",
+    )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Run the FastAPI webhook server and background queue worker",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug-level logging",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate configuration and exit without running the pipeline",
+    )
+    args = parser.parse_args(argv)
+    _setup_logging(args.verbose)
+
+    settings = get_settings()
+
+    if args.server:
+        import uvicorn
+        logger.info(
+            "Starting Webhook Server on %s:%d...",
+            settings.webhook_host,
+            settings.webhook_port,
+        )
+        uvicorn.run(
+            "webhook.app:app",
+            host=settings.webhook_host,
+            port=settings.webhook_port,
+            log_level="info",
+        )
+        return 0
+
+    if not args.ticket_id:
+        parser.error("Either ticket_id or --server must be specified.")
+
+    return run_pipeline(
+        ticket_id=args.ticket_id,
+        dry_run=args.dry_run,
+        settings=settings,
+    )
 
 
 if __name__ == "__main__":

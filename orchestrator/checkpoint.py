@@ -38,6 +38,11 @@ class Checkpoint:
     code_branch: str = ""
     ci_pipeline_id: int | None = None
     validation_result: dict[str, Any] = field(default_factory=dict)
+    gate2_mr_iid: int | None = None
+    gate2_approved: bool = False
+    review_iteration_count: int = 0
+    reviewer_feedback: list[str] = field(default_factory=list)
+    final_mr_url: str = ""
 
     # ── Persistence ─────────────────────────────────────────────────────
 

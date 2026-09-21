@@ -45,6 +45,7 @@ def wait_for_approval(
     mr_iid: int,
     poll_interval_seconds: int = 30,
     timeout_hours: float = 48.0,
+    return_on_changes_requested: bool = False,
 ) -> GateResult:
     """
     Poll a GitLab MR's approval state until it is approved or times out.
@@ -59,13 +60,15 @@ def wait_for_approval(
         Seconds between successive API polls.
     timeout_hours:
         Maximum hours to wait before raising ``GateTimeoutError``.
+    return_on_changes_requested:
+        If True, return immediately with CHANGES_REQUESTED when reviewer comments
+        are detected on an unapproved MR.
 
     Returns
     -------
     GateResult
         Contains outcome, approver usernames, and any non-system comments
-        posted since the MR was opened (useful for routing reviewer
-        feedback back to the LLM).
+        posted since the MR was opened.
     """
     deadline = time.monotonic() + (timeout_hours * 3600)
     logger.info("Waiting for approval on MR !%d (timeout=%.1fh)", mr_iid, timeout_hours)
@@ -83,8 +86,7 @@ def wait_for_approval(
             logger.info("MR !%d APPROVED by %s", mr_iid, result.approved_by)
             return result
 
-        # Check for reviewer comments that might signal change requests
-        # (heuristic: non-system comments posted after the MR creation).
+        # Check for reviewer comments that might signal change requests.
         comments = _fetch_comments(gitlab, mr_iid)
         if comments:
             logger.info(
@@ -92,6 +94,13 @@ def wait_for_approval(
                 mr_iid,
                 len(comments),
             )
+            if return_on_changes_requested:
+                logger.info("Returning early on reviewer feedback for MR !%d", mr_iid)
+                return GateResult(
+                    outcome=GateOutcome.CHANGES_REQUESTED,
+                    approved_by=[],
+                    reviewer_comments=comments,
+                )
 
         logger.debug("MR !%d not yet approved — polling again in %ds", mr_iid, poll_interval_seconds)
         time.sleep(poll_interval_seconds)

@@ -113,6 +113,10 @@ class LLMClient:
         else:
             self._history = []
 
+    def append_user_message(self, content: str) -> None:
+        """Manually append a user message (e.g. reviewer feedback) to history."""
+        self._history.append({"role": "user", "content": content})
+
     # ── Internals ───────────────────────────────────────────────────────
 
     def _active_model(self) -> str:

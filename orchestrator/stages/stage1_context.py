@@ -63,6 +63,28 @@ class TicketContext:
     all_file_paths: list[str]     # full tree listing (paths only)
 
 
+_INELIGIBLE_KEYWORDS = (
+    ("database migration", "Database schema migration detected"),
+    ("db migration", "Database schema migration detected"),
+    ("alter table", "SQL/schema alteration detected"),
+    ("schema overhaul", "Database schema changes detected"),
+    ("jwt token authentication overhaul", "Security/Auth core overhaul detected"),
+    ("cross-repo", "Multi-repository modification not supported"),
+    ("multi-repo", "Multi-repository modification not supported"),
+)
+
+
+def _check_qualification(ticket: TicketData) -> str | None:
+    """Return reason if ticket is ineligible for automation, or None if eligible."""
+    content = f"{ticket.summary} {ticket.description}".lower()
+    for kw, reason in _INELIGIBLE_KEYWORDS:
+        if kw in content:
+            return reason
+    if not ticket.acceptance_criteria or not ticket.acceptance_criteria.strip():
+        return "Missing acceptance criteria"
+    return None
+
+
 def run(
     ticket_id: str,
     jira: JiraClient,
@@ -106,6 +128,34 @@ def run(
         raise ValueError(
             f"Ticket {ticket_id} does not carry the qualifying label "
             f"'{qualifying_label}'.  Labels present: {ticket.labels}"
+        )
+
+    # ── Qualification triage check (Phase 4) ───────────────────────────
+    disqualification_reason = _check_qualification(ticket)
+    if disqualification_reason:
+        logger.warning(
+            "Ticket %s failed qualification triage: %s",
+            ticket_id,
+            disqualification_reason,
+        )
+        jira.post_lifecycle_comment(
+            ticket_id=ticket_id,
+            title="Triage: Ineligible for Automation",
+            message=(
+                f"This ticket was flagged with `{qualifying_label}` but is "
+                f"ineligible for spec-driven automation:\n"
+                f"**Reason:** {disqualification_reason}\n\n"
+                f"The label `{qualifying_label}` has been removed."
+            ),
+        )
+        jira.remove_label(ticket_id, qualifying_label)
+        audit.log(
+            stage=1,
+            event_type="stage1_triaged_ineligible",
+            payload={"reason": disqualification_reason},
+        )
+        raise ValueError(
+            f"Ticket {ticket_id} is ineligible for automation: {disqualification_reason}"
         )
 
     # ── 2. Enumerate repository file tree ───────────────────────────────

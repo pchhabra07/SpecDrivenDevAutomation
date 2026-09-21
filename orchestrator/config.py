@@ -97,6 +97,38 @@ class Settings(BaseSettings):
     slack_webhook_url: str = Field("", description="Slack incoming webhook URL")
     escalation_email: str = Field("", description="Email address for escalation alerts")
 
+    # ── Webhook service (Phase 3) ──────────────────────────────────────
+    jira_webhook_secret: str = Field(
+        "",
+        description="Shared secret for validating incoming JIRA webhooks via HMAC-SHA256",
+    )
+    webhook_host: str = Field("0.0.0.0", description="Host to bind FastAPI webhook service")
+    webhook_port: int = Field(8000, description="Port to bind FastAPI webhook service")
+    gitlab_webhook_secret: str = Field(
+        "",
+        description="Secret token to validate incoming GitLab webhooks",
+    )
+
+    # ── Reviewer feedback loop (Phase 3) ───────────────────────────────
+    max_review_iterations: int = Field(
+        3,
+        description="Max reviewer change-request iterations in Gate 2 before escalation",
+    )
+
+    # ── Audit shipping & SIEM (Phase 4) ────────────────────────────────
+    audit_shipping_mode: str = Field(
+        "none",
+        description="Audit shipping mode: 'git', 'http', or 'none'",
+    )
+    audit_gitlab_repo_id: int | None = Field(
+        None,
+        description="GitLab repo ID to commit audit logs into when audit_shipping_mode is 'git'",
+    )
+    siem_webhook_url: str = Field(
+        "",
+        description="HTTPS endpoint for SIEM audit log shipping when mode is 'http'",
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

@@ -108,3 +108,104 @@ def build_escalation_message(
         f"**Draft PR:** {mr_url}\n\n"
         f"Please continue this ticket manually."
     )
+
+
+def notify_gate1_pending(
+    slack_webhook_url: str,
+    escalation_email: str,
+    ticket_id: str,
+    mr_url: str,
+    test_count: int,
+) -> None:
+    """Notify reviewer that Gate 1 tests are generated and ready for approval."""
+    msg = (
+        f"📝 *Gate 1 Review Required — {ticket_id}*\n"
+        f"The Spec-Driven Development agent generated {test_count} test file(s) "
+        f"derived from the ticket's acceptance criteria.\n"
+        f"Please review and approve the tests on GitLab: {mr_url}"
+    )
+    if slack_webhook_url:
+        notify_slack(slack_webhook_url, msg)
+    if escalation_email:
+        notify_email(escalation_email, f"[Gate 1] Tests Ready for Review: {ticket_id}", msg)
+
+
+def notify_gate2_pending(
+    slack_webhook_url: str,
+    escalation_email: str,
+    ticket_id: str,
+    mr_url: str,
+    gate_results_summary: str,
+) -> None:
+    """Notify reviewer that code changes and validation gates passed and MR is ready."""
+    msg = (
+        f"🚀 *Gate 2 Review Required — {ticket_id}*\n"
+        f"The automated pipeline has completed code generation and all CI validation gates passed!\n\n"
+        f"*Quality Gates:*\n{gate_results_summary}\n\n"
+        f"*GitLab Merge Request:* {mr_url}\n"
+        f"Please review the PR and approve in GitLab."
+    )
+    if slack_webhook_url:
+        notify_slack(slack_webhook_url, msg)
+    if escalation_email:
+        notify_email(escalation_email, f"[Gate 2] PR Ready for Review: {ticket_id}", msg)
+
+
+def notify_gate2_approved(
+    slack_webhook_url: str,
+    escalation_email: str,
+    ticket_id: str,
+    mr_url: str,
+    approved_by: list[str],
+) -> None:
+    """Notify team that Gate 2 MR was approved by a human reviewer."""
+    users_str = ", ".join(f"@{u}" for u in approved_by) if approved_by else "reviewer"
+    msg = (
+        f"✅ *MR Approved — {ticket_id}*\n"
+        f"GitLab MR {mr_url} has been approved by {users_str}!\n"
+        f"Ready for human merge in GitLab."
+    )
+    if slack_webhook_url:
+        notify_slack(slack_webhook_url, msg)
+    if escalation_email:
+        notify_email(escalation_email, f"[Approved] {ticket_id} MR Approved", msg)
+
+
+def notify_feedback_received(
+    slack_webhook_url: str,
+    escalation_email: str,
+    ticket_id: str,
+    mr_url: str,
+    feedback_notes: list[str],
+) -> None:
+    """Notify that reviewer requested changes on Gate 2 MR."""
+    notes_preview = "\n- ".join(feedback_notes[:3])
+    msg = (
+        f"🔄 *Reviewer Feedback Received — {ticket_id}*\n"
+        f"Reviewer requested changes on GitLab MR: {mr_url}\n\n"
+        f"*Feedback summary:*\n- {notes_preview}\n\n"
+        f"The agent is re-entering Stage 3 to apply corrections."
+    )
+    if slack_webhook_url:
+        notify_slack(slack_webhook_url, msg)
+    if escalation_email:
+        notify_email(escalation_email, f"[Changes Requested] {ticket_id}", msg)
+
+
+def notify_pipeline_complete(
+    slack_webhook_url: str,
+    escalation_email: str,
+    ticket_id: str,
+    mr_url: str,
+) -> None:
+    """Notify team that ticket pipeline has completed successfully."""
+    msg = (
+        f"🎉 *Pipeline Complete — {ticket_id}*\n"
+        f"All spec-driven development stages completed for {ticket_id}.\n"
+        f"GitLab MR: {mr_url}"
+    )
+    if slack_webhook_url:
+        notify_slack(slack_webhook_url, msg)
+    if escalation_email:
+        notify_email(escalation_email, f"[Complete] {ticket_id} Pipeline Finished", msg)
+

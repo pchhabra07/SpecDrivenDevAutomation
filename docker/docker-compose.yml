@@ -1,21 +1,29 @@
-version: "3.9"
+version: "3.8"
 
 services:
   orchestrator:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    container_name: spec-driven-orchestrator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
     env_file:
       - ../.env
     volumes:
-      - checkpoints:/app/checkpoints
-      - audit:/app/audit
-    # Pass ticket ID as a command argument:
-    #   docker compose run orchestrator python -m orchestrator.main PROJ-123
-    entrypoint: ["python", "-m", "orchestrator.main"]
+      - checkpoints_data:/app/checkpoints
+      - audit_data:/app/audit
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
-  checkpoints:
+  checkpoints_data:
     driver: local
-  audit:
+  audit_data:
     driver: local

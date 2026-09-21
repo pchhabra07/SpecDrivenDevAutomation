@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    volumes:
+      - checkpoints:/app/checkpoints
+      - audit:/app/audit
+    # Pass ticket ID as a command argument:
+    #   docker compose run orchestrator python -m orchestrator.main PROJ-123
+    entrypoint: ["python", "-m", "orchestrator.main"]
+
+volumes:
+  checkpoints:
+    driver: local
+  audit:
+    driver: local

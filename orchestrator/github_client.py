@@ -73,7 +73,10 @@ class GitHubClient:
         token: str,
         repo: str,
         base_url: str = "https://api.github.com",
+        workflow_file: str | None = None,
     ) -> None:
+        self._token = token
+        self._workflow_file = workflow_file
         if token:
             auth = Auth.Token(token)
             self._gh = Github(auth=auth, base_url=base_url)
@@ -88,6 +91,19 @@ class GitHubClient:
     def repo_name(self) -> str:
         """Return full repository name ('owner/repo')."""
         return self._repo.full_name
+
+    @property
+    def short_repo_name(self) -> str:
+        """Return short repository name (e.g. 'Full-Stack-To-Do-List')."""
+        return self._repo_name.split("/")[-1].removesuffix(".git")
+
+    @property
+    def default_workflow_file(self) -> str:
+        """Dynamic default workflow file named after the repository."""
+        if self._workflow_file:
+            return self._workflow_file
+        from orchestrator.ci_generator import get_target_ci_filename
+        return get_target_ci_filename(self._repo_name)
 
     @property
     def project_id(self) -> str:
@@ -156,6 +172,18 @@ class GitHubClient:
         except GithubException:
             return False
 
+    def delete_file(self, path: str, branch: str, message: str) -> bool:
+        """Delete a file from *branch* if it exists."""
+        try:
+            content = self._repo.get_contents(path, ref=branch)
+            if not isinstance(content, list):
+                self._repo.delete_file(path, message, content.sha, branch=branch)
+                logger.info("Deleted %s from branch %s", path, branch)
+                return True
+        except Exception as exc:
+            logger.debug("Could not delete %s from %s: %s", path, branch, exc)
+        return False
+
     # ── Commits ─────────────────────────────────────────────────────────
 
     def commit_files(
@@ -170,6 +198,11 @@ class GitHubClient:
         Create a single commit that creates/updates multiple files.
         Enforces test-file locking via blocked_paths.
         """
+        if not files:
+            logger.warning("commit_files called with 0 files on branch %s; skipping commit.", branch)
+            target_branch = self._repo.get_branch(branch)
+            return target_branch.commit.sha
+
         if blocked_paths:
             violations = set(files.keys()) & blocked_paths
             if violations:
@@ -385,42 +418,111 @@ class GitHubClient:
     def trigger_workflow(
         self,
         branch: str,
-        workflow_name_or_file: str = "spec-driven-dev-ci.yml",
+        workflow_name_or_file: str | None = None,
         inputs: dict[str, str] | None = None,
+        timeout_seconds: int = 35,
+        commit_sha: str | None = None,
     ) -> int:
         """
         Trigger or find the active GitHub Actions workflow run on *branch*.
         """
+        target_file = workflow_name_or_file or self.default_workflow_file
         try:
-            workflow = self._repo.get_workflow(workflow_name_or_file)
+            workflow = self._repo.get_workflow(target_file)
             workflow.create_dispatch(ref=branch, inputs=inputs or {})
-            time.sleep(2)  # Give GitHub Actions a moment to queue the run
+            logger.info("Workflow dispatch created for %s on %s", target_file, branch)
         except Exception as exc:
-            logger.info("Workflow dispatch not triggered (%s); falling back to latest push run", exc)
+            logger.debug(
+                "Workflow dispatch not triggered for %s (%s); polling for push run",
+                target_file,
+                exc,
+            )
 
-        # Retrieve latest run on branch
+        # Poll for active or latest workflow run on this branch
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < timeout_seconds:
+            try:
+                runs = list(self._repo.get_workflow_runs(branch=branch))
+                for run in runs[:5]:
+                    if commit_sha and run.head_sha == commit_sha:
+                        logger.info(
+                            "Active workflow run %d found matching commit %s on %s (status: %s, workflow: %s)",
+                            run.id,
+                            commit_sha[:8],
+                            branch,
+                            run.status,
+                            run.name,
+                        )
+                        return run.id
+                    elif not commit_sha and run.status in ("queued", "in_progress"):
+                        logger.info(
+                            "Active workflow run %d found on %s (status: %s, workflow: %s)",
+                            run.id,
+                            branch,
+                            run.status,
+                            run.name,
+                        )
+                        return run.id
+            except Exception as exc:
+                logger.debug("Error checking workflow runs on %s: %s", branch, exc)
+            time.sleep(3)
+
+        # Fallback to most recent run on this branch
         runs = list(self._repo.get_workflow_runs(branch=branch))
         if runs:
-            latest_run = runs[0]
-            logger.info("Active workflow run %d found on %s", latest_run.id, branch)
-            return latest_run.id
+            latest = runs[0]
+            logger.info(
+                "Returning latest workflow run %d on %s (head_sha: %s, status: %s)",
+                latest.id,
+                branch,
+                latest.head_sha[:8],
+                latest.status,
+            )
+            return latest.id
 
-        # Fallback dummy run id if workflow run hasn't appeared yet
+        logger.warning("No workflow runs found on branch %s for %s", branch, target_file)
         return 1
 
     def trigger_pipeline(
         self,
         branch: str,
         variables: dict[str, str] | None = None,
+        commit_sha: str | None = None,
     ) -> int:
         """Compatibility alias for trigger_workflow."""
-        return self.trigger_workflow(branch=branch, inputs=variables)
+        return self.trigger_workflow(
+            branch=branch, inputs=variables, commit_sha=commit_sha
+        )
+
+    def get_job_trace(self, job_id: int) -> str:
+        """Fetch raw log output for a workflow job by ID."""
+        import requests
+
+        try:
+            url = f"https://api.github.com/repos/{self.repo_name}/actions/jobs/{job_id}/logs"
+            headers = {"Accept": "application/vnd.github+json"}
+            if self._token:
+                headers["Authorization"] = f"Bearer {self._token}"
+            res = requests.get(url, headers=headers, allow_redirects=True, timeout=30)
+            if res.status_code == 200:
+                return res.text
+        except Exception as exc:
+            logger.warning("Could not fetch logs for job %d: %s", job_id, exc)
+        return ""
 
     def get_workflow_status(self, run_id: int) -> WorkflowRunResult:
         """Poll the status of a GitHub Actions workflow run."""
-        run = self._repo.get_workflow_run(run_id)
+        try:
+            run = self._repo.get_workflow_run(run_id)
+        except Exception as exc:
+            logger.warning("Workflow run %d not found on GitHub: %s", run_id, exc)
+            return WorkflowRunResult(
+                pipeline_id=run_id,
+                status="failed",
+                web_url=f"{self._repo.html_url}/actions",
+                jobs=[],
+            )
 
-        # Map GitHub conclusions to pipeline status
         status = run.status
         conclusion = run.conclusion
 
@@ -434,7 +536,11 @@ class GitHubClient:
         jobs: list[dict[str, Any]] = []
         try:
             for j in run.jobs():
-                job_status = "success" if j.conclusion == "success" else (j.conclusion or j.status)
+                job_status = (
+                    "success"
+                    if j.conclusion == "success"
+                    else (j.conclusion or j.status)
+                )
                 jobs.append({
                     "id": j.id,
                     "name": j.name,

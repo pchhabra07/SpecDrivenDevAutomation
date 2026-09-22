@@ -39,21 +39,38 @@ from orchestrator.stages import (
 logger = logging.getLogger("orchestrator")
 
 _SYSTEM_PROMPT = (
-    "You are a spec-driven development agent.  Your job is to analyse JIRA "
-    "tickets for a JavaScript/TypeScript/React/Redux codebase, generate Jest "
-    "test cases from the ticket's acceptance criteria, and later implement "
+    "You are a spec-driven development agent.  Your job is to analyse "
+    "tickets, generate test cases from acceptance criteria, and implement "
     "code changes that make those tests pass.  Always follow the file-path "
     "output format specified in each prompt."
 )
 
 
-def _setup_logging(verbose: bool = False) -> None:
+def _setup_logging(verbose: bool = False, debug_wire: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(asctime)s  %(name)-28s  %(levelname)-5s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # Always silence noisy 3rd-party HTTP transport and client wire dumps unless debug_wire is explicitly enabled
+    if not debug_wire:
+        noisy_wire_loggers = (
+            "urllib3",
+            "urllib3.connectionpool",
+            "requests",
+            "httpx",
+            "httpcore",
+            "httpcore.connection",
+            "httpcore.http11",
+            "openai",
+            "openai._base_client",
+            "github",
+            "github.Requester",
+            "git",
+        )
+        for noisy in noisy_wire_loggers:
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def run_pipeline(
@@ -88,6 +105,7 @@ def run_pipeline(
             token=settings.github_token,
             repo=settings.github_repo,
             base_url=settings.github_base_url,
+            workflow_file=settings.github_workflow_file or None,
         )
     else:
         jira = JiraClient(
@@ -124,8 +142,8 @@ def run_pipeline(
             checkpoint.current_stage,
             checkpoint.iteration_count,
         )
-        if checkpoint.repo_id and checkpoint.repo_id != gitlab.project_id:
-            logger.info("Resuming ticket in mapped repository ID %d", checkpoint.repo_id)
+        if checkpoint.repo_id and str(checkpoint.repo_id) != str(gitlab.project_id):
+            logger.info("Resuming ticket in mapped repository ID %s", checkpoint.repo_id)
             gitlab.switch_project(checkpoint.repo_id)
         if checkpoint.conversation_history:
             llm.set_history(checkpoint.conversation_history)
@@ -185,7 +203,7 @@ def run_pipeline(
             )
 
         # ── Stage 2: Generate Tests + Gate 1 ────────────────────────────
-        if checkpoint.current_stage <= 2:
+        if checkpoint.current_stage <= 2 and not checkpoint.gate1_approved:
             logger.info("▶ Stage 2: Generate Test Cases + Human Gate 1")
             locked_tests = stage2_test_gen.run(
                 context=context,
@@ -348,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         "ticket_id",
         nargs="?",
         default=None,
-        help="JIRA ticket key to process in CLI mode (e.g. PROJ-123)",
+        help="Ticket ID/number to process in CLI mode (e.g. 1 or PROJ-123)",
     )
     parser.add_argument(
         "--server",
@@ -365,8 +383,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Validate configuration and exit without running the pipeline",
     )
+    parser.add_argument(
+        "--debug-wire",
+        action="store_true",
+        help="Enable raw HTTP/socket transport debug logging (very verbose)",
+    )
     args = parser.parse_args(argv)
-    _setup_logging(args.verbose)
+    _setup_logging(args.verbose, args.debug_wire)
 
     settings = get_settings()
 

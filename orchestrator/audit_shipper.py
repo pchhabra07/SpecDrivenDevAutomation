@@ -3,7 +3,7 @@ Audit Log Governance & SIEM Shipping (Phase 4).
 
 Provides immutable audit trail persistence by exporting per-ticket JSONL
 logs to either:
-  1. A dedicated, write-restricted GitLab audit repository ('git' mode).
+  1. A dedicated, write-restricted VCS audit repository ('git' mode on GitHub or GitLab).
   2. An enterprise SIEM or HTTP log ingestion endpoint ('http' mode).
 
 Implements FR-25.
@@ -20,7 +20,6 @@ from typing import Any
 import httpx
 
 from orchestrator.config import Settings
-from orchestrator.gitlab_client import GitLabClient
 
 logger = logging.getLogger(__name__)
 

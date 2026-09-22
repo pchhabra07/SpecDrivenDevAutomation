@@ -4,12 +4,11 @@ Stage 2 — Generate Test Cases (Pre-Development).
 Prompts the LLM to generate Jest test cases driven by the ticket's
 specification and acceptance criteria — *before* any code changes are
 made.  The proposed tests are committed to a dedicated branch and
-presented as a GitLab MR for human review (Gate 1).
+presented as a PR/MR for human review (Gate 1).
 
-Once the reviewer approves the MR, the test files are "locked" by
-recording their SHA-256 hashes in the checkpoint.  From this point
-forward the coding stage (Stage 3) is forbidden from modifying these
-files.
+Once the reviewer approves, the test files are "locked" by recording
+their SHA-256 hashes in the checkpoint.  From this point forward the
+coding stage (Stage 3) is forbidden from modifying these files.
 
 If the reviewer requests changes, the LLM is re-prompted with the
 reviewer's comments, generates updated tests, force-pushes to the
@@ -25,7 +24,6 @@ from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
-from orchestrator.gitlab_client import GitLabClient
 from orchestrator.gitlab_gate import GateOutcome, wait_for_approval
 from orchestrator.llm_client import LLMClient
 from orchestrator.stages.stage1_context import TicketContext
@@ -39,7 +37,7 @@ _MAX_REVISION_CYCLES = 5
 
 def run(
     context: TicketContext,
-    gitlab: GitLabClient,
+    gitlab: Any,
     llm: LLMClient,
     checkpoint: Checkpoint,
     audit: AuditLogger,
@@ -58,38 +56,64 @@ def run(
     ticket = context.ticket
 
     # ── 1. Generate test cases via LLM ──────────────────────────────────
+    logger.info("Calling LLM to generate test cases…")
     generated_tests = _generate_tests(llm, context)
     logger.info("LLM generated %d test file(s)", len(generated_tests))
 
+    if not generated_tests:
+        logger.error("LLM returned no test files for ticket %s", ticket.ticket_id)
+        raise RuntimeError(
+            f"Stage 2 failed: LLM did not generate any test files matching the expected format for ticket {ticket.ticket_id}."
+        )
+
     # ── 2. Create the tests-only branch ─────────────────────────────────
+    logger.info("Creating test branch…")
     tests_branch = f"automation/{ticket.ticket_id}/tests"
     if not gitlab.branch_exists(tests_branch):
         gitlab.create_branch(tests_branch, ref=context.default_branch)
     checkpoint.tests_branch = tests_branch
 
+    # Ensure CI workflow exists for target repository
+    from orchestrator.ci_generator import ensure_target_ci_workflow
+
+    repo_id = getattr(gitlab, "project_id", None) or getattr(gitlab, "repo_name", "target-repo")
+    ci_workflow_path, ci_created = ensure_target_ci_workflow(
+        gitlab=gitlab,
+        branch=tests_branch,
+        repo_identifier=repo_id,
+        all_file_paths=context.all_file_paths,
+    )
+
     # ── 3. Commit test files ────────────────────────────────────────────
+    logger.info("Committing generated tests to branch %s", tests_branch)
     gitlab.commit_files(
         branch=tests_branch,
         files=generated_tests,
         commit_message=f"[spec-driven] Generate tests for {ticket.ticket_id}",
     )
 
-    # ── 4. Open a draft MR for Gate 1 ──────────────────────────────────
+    # ── 4. Open a draft PR/MR for Gate 1 ──────────────────────────────
     if checkpoint.gate1_mr_iid is None:
+        logger.info("Opening draft PR for Gate 1 review…")
         mr_info = gitlab.create_mr(
             source_branch=tests_branch,
             target_branch=context.default_branch,
             title=f"[Gate 1] Tests for {ticket.ticket_id}: {ticket.summary}",
-            description=_build_mr_description(ticket, generated_tests),
+            description=_build_mr_description(
+                ticket,
+                generated_tests,
+                ci_workflow_path=ci_workflow_path if ci_created else None,
+            ),
             draft=True,
         )
         checkpoint.gate1_mr_iid = mr_info.iid
         audit.log(stage=2, event_type="gate1_opened", payload={"mr_iid": mr_info.iid})
     else:
-        # MR already exists (e.g. resumed from checkpoint).
-        logger.info("Reusing existing Gate 1 MR !%d", checkpoint.gate1_mr_iid)
+        # PR/MR already exists (e.g. resumed from checkpoint).
+        logger.info("Reusing existing Gate 1 PR #%d", checkpoint.gate1_mr_iid)
 
     # ── 5. Wait for human approval (with revision loop) ────────────────
+    logger.info("Waiting for Gate 1 human approval…")
     approved_tests = generated_tests
     for cycle in range(1, _MAX_REVISION_CYCLES + 1):
         logger.info("Gate 1 approval cycle %d/%d", cycle, _MAX_REVISION_CYCLES)
@@ -99,6 +123,7 @@ def run(
             mr_iid=checkpoint.gate1_mr_iid,
             poll_interval_seconds=gate_poll_interval,
             timeout_hours=gate_timeout_hours,
+            return_on_changes_requested=True,
         )
 
         if gate_result.outcome == GateOutcome.APPROVED:
@@ -183,11 +208,10 @@ def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
         )
 
     prompt = (
-        "You are a senior test engineer specialising in JavaScript/TypeScript, "
-        "React, and Redux.  Your task is to generate comprehensive Jest test "
-        "cases based **solely** on the ticket's specification and acceptance "
+        "You are a senior test engineer.  Your task is to generate comprehensive "
+        "test cases based **solely** on the ticket's specification and acceptance "
         "criteria below — NOT from the existing code.\n\n"
-        "## JIRA Ticket\n"
+        "## Ticket\n"
         f"**ID:** {ticket.ticket_id}\n"
         f"**Summary:** {ticket.summary}\n"
         f"**Description:**\n{ticket.description}\n\n"
@@ -255,67 +279,75 @@ def _parse_test_files(llm_output: str) -> dict[str, str]:
     """
     Parse the LLM's response into ``{file_path: content}`` pairs.
 
-    Expected format — each file is preceded by a ``// FILE: <path>`` comment
-    and wrapped in a fenced code block:
-
-        // FILE: src/__tests__/foo.test.ts
-        ```typescript
-        import ...
-        ```
+    Supports:
+      - ``// FILE: path``, ``# FILE: path``, ``/* FILE: path */``
+      - ``// filepath: path``, ``// filename: path``
+      - Markdown headers like ``### `path` ``
+      - Both fenced (```) and unfenced code outputs
     """
     files: dict[str, str] = {}
-    lines = llm_output.split("\n")
+    lines = llm_output.splitlines()
     current_path: str | None = None
     current_content: list[str] = []
-    in_code_block = False
+
+    prefixes = ("// FILE:", "# FILE:", "/* FILE:", "// filepath:", "// filename:", "# filepath:", "# filename:")
 
     for line in lines:
         stripped = line.strip()
 
-        # Detect file-path marker.
-        if stripped.startswith("// FILE:"):
-            # Save previous file if any.
+        # Check for file marker
+        is_marker = False
+        target_path = None
+
+        for prefix in prefixes:
+            if stripped.lower().startswith(prefix.lower()):
+                raw = stripped[len(prefix):].removesuffix("*/").strip().strip("`'\"")
+                if raw:
+                    is_marker = True
+                    target_path = raw.replace("\\", "/")
+                    break
+
+        if not is_marker and (stripped.startswith("### `") or stripped.startswith("## `")) and stripped.endswith("`"):
+            raw = stripped.lstrip("#").strip().strip("`'\"")
+            if "." in raw:  # looks like a file path
+                is_marker = True
+                target_path = raw.replace("\\", "/")
+
+        if is_marker and target_path:
             if current_path and current_content:
-                files[current_path] = "\n".join(current_content)
-            current_path = stripped.removeprefix("// FILE:").strip()
+                files[current_path] = "\n".join(current_content).strip()
+            current_path = target_path
             current_content = []
-            in_code_block = False
             continue
 
-        # Detect code fence boundaries.
-        if stripped.startswith("```"):
-            if in_code_block:
-                # Closing fence — end of current file content.
-                in_code_block = False
-                if current_path and current_content:
-                    files[current_path] = "\n".join(current_content)
-                    current_content = []
+        if current_path is not None:
+            # Skip code fence lines like ``` or ```typescript
+            if stripped.startswith("```"):
                 continue
-            else:
-                in_code_block = True
-                continue
-
-        if in_code_block and current_path is not None:
             current_content.append(line)
 
-    # Handle last file if the LLM forgot the closing fence.
     if current_path and current_content:
-        files[current_path] = "\n".join(current_content)
+        files[current_path] = "\n".join(current_content).strip()
 
     return files
 
 
-def _build_mr_description(ticket: Any, test_files: dict[str, str]) -> str:
+def _build_mr_description(
+    ticket: Any,
+    test_files: dict[str, str],
+    ci_workflow_path: str | None = None,
+) -> str:
     """Build the Gate-1 MR description body."""
     file_list = "\n".join(f"- `{path}`" for path in test_files)
+    ci_note = f"\n- **CI Validation Workflow:** `{ci_workflow_path}`\n" if ci_workflow_path else ""
     return (
         f"## Spec-Driven Test Generation — Gate 1 Review\n\n"
-        f"**JIRA Ticket:** {ticket.ticket_id} — {ticket.summary}\n\n"
+        f"**Ticket:** {ticket.ticket_id} — {ticket.summary}\n\n"
         f"### Acceptance Criteria\n{ticket.acceptance_criteria}\n\n"
-        f"### Generated Test Files\n{file_list}\n\n"
+        f"### Generated Test Files\n{file_list}\n{ci_note}\n"
         f"---\n"
         f"Please review these tests for correctness and completeness "
-        f"against the acceptance criteria.  **Approve this MR** to lock "
+        f"against the acceptance criteria.  **Approve this PR** to lock "
         f"the tests and proceed to automated code generation.\n\n"
         f"Any comments will be routed back to the AI agent for revision."
     )

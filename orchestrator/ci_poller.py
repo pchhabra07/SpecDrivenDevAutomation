@@ -1,9 +1,8 @@
 """
 CI/CD pipeline trigger and polling — thin coordination layer.
 
-Triggers a GitLab CI/CD pipeline for a given branch and polls
-``gitlab_client.get_pipeline_status`` until the pipeline reaches a
-terminal state (``success``, ``failed``, ``canceled``).
+Triggers a CI/CD pipeline (GitHub Actions or GitLab CI) for a given branch
+and polls until the pipeline reaches a terminal state (``success``, ``failed``, ``canceled``).
 
 Used by Stage 3 (test-only runs) and Stage 4 (full validation).
 """
@@ -49,6 +48,7 @@ def trigger_ci(
     client: Any,
     branch: str,
     variables: dict[str, str] | None = None,
+    commit_sha: str | None = None,
 ) -> int:
     """
     Trigger a CI/CD pipeline on *branch* and return its pipeline ID.
@@ -61,13 +61,23 @@ def trigger_ci(
         The Git branch to run the pipeline on.
     variables:
         Optional CI/CD variables to pass (e.g. ``TEST_ONLY=true``).
+    commit_sha:
+        Optional commit SHA to wait for in GitHub Actions.
 
     Returns
     -------
     int
         The pipeline ID.
     """
-    pipeline_id = client.trigger_pipeline(branch, variables=variables)
+    if commit_sha is not None:
+        try:
+            pipeline_id = client.trigger_pipeline(
+                branch, variables=variables, commit_sha=commit_sha
+            )
+        except TypeError:
+            pipeline_id = client.trigger_pipeline(branch, variables=variables)
+    else:
+        pipeline_id = client.trigger_pipeline(branch, variables=variables)
     logger.info("CI pipeline %d triggered on branch %s", pipeline_id, branch)
     return pipeline_id
 

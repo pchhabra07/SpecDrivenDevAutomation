@@ -2,7 +2,7 @@
 Dynamic Repository Resolver (Phase 5).
 
 Enables multi-repository scaling across team boundaries.
-Resolves GitLab project IDs dynamically from JIRA ticket components, labels,
+Resolves target repository identifiers dynamically from ticket components, labels,
 or project keys using the mapping configured in `REPO_MAPPING`.
 """
 
@@ -69,7 +69,7 @@ class RepoResolver:
                 if key in self._mapping:
                     matched_id = self._mapping[key]
                     logger.info(
-                        "Resolved ticket %s to repo ID %d via component '%s'",
+                        "Resolved ticket %s to repo ID %s via component '%s'",
                         ticket.ticket_id,
                         matched_id,
                         comp,
@@ -84,7 +84,7 @@ class RepoResolver:
                 if norm_label in self._mapping:
                     matched_id = self._mapping[norm_label]
                     logger.info(
-                        "Resolved ticket %s to repo ID %d via label '%s'",
+                        "Resolved ticket %s to repo ID %s via label '%s'",
                         ticket.ticket_id,
                         matched_id,
                         label,
@@ -106,7 +106,7 @@ class RepoResolver:
             if proj_key in self._mapping:
                 matched_id = self._mapping[proj_key]
                 logger.info(
-                    "Resolved ticket %s to repo ID %d via project key '%s'",
+                    "Resolved ticket %s to repo ID %s via project key '%s'",
                     ticket.ticket_id,
                     matched_id,
                     proj_key,

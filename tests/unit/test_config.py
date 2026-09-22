@@ -39,7 +39,7 @@ class TestSettings:
     def test_defaults_are_applied(self):
         """Optional fields should use their defaults."""
         with patch.dict(os.environ, _REQUIRED_ENV, clear=False):
-            s = Settings()
+            s = Settings(_env_file=None)
             assert s.qualifying_label == "SpecDrivenDev"
             assert s.nim_model == "z-ai/glm-5.3"
             assert s.rate_limit_cap == 32

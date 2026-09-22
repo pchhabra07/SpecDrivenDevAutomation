@@ -156,12 +156,14 @@ class LLMClient:
                     "messages": self._history,
                     "temperature": temperature,
                 }
-                if tools:
-                    kwargs["tools"] = tools
-                    kwargs["tool_choice"] = "auto"
-
+                logger.info("Calling LLM (%s), waiting for response…", model)
+                t0 = time.monotonic()
                 response = self._client.chat.completions.create(**kwargs)
+                elapsed = time.monotonic() - t0
                 msg = response.choices[0].message.model_dump()
+                usage = getattr(response, "usage", None)
+                tokens_info = f" (prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens})" if usage else ""
+                logger.info("LLM responded in %.1fs%s", elapsed, tokens_info)
                 self._consecutive_failures = 0
                 return msg
 

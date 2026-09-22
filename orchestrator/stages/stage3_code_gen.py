@@ -16,13 +16,12 @@ Implements FR-9, FR-10, FR-11.
 from __future__ import annotations
 
 import logging
+import time as _time
 from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.ci_poller import CIResult, trigger_ci, wait_for_pipeline
-from orchestrator.gitlab_client import GitLabClient
-from orchestrator.jira_client import JiraClient
 from orchestrator.llm_client import LLMClient
 from orchestrator.notifier import (
     build_escalation_message,
@@ -40,9 +39,9 @@ _MAX_LOCKED_REJECTIONS = 3
 
 def run(
     context: TicketContext,
-    gitlab: GitLabClient,
+    gitlab: Any,
     llm: LLMClient,
-    jira: JiraClient,
+    jira: Any,
     checkpoint: Checkpoint,
     audit: AuditLogger,
     *,
@@ -63,14 +62,29 @@ def run(
     audit.log(stage=3, event_type="stage3_start")
     ticket = context.ticket
 
-    # ── Setup branch ────────────────────────────────────────────────────
-    code_branch = f"automation/{ticket.ticket_id}"
+    # ── Setup branch ────────────────────────────────────────────────
+    logger.info("Setting up code branch…")
+    code_branch = f"automation/{ticket.ticket_id}/code"
+    tests_branch = f"automation/{ticket.ticket_id}/tests"
+    ref_branch = tests_branch if gitlab.branch_exists(tests_branch) else context.default_branch
     if not gitlab.branch_exists(code_branch):
-        gitlab.create_branch(code_branch, ref=context.default_branch)
+        gitlab.create_branch(code_branch, ref=ref_branch)
     checkpoint.code_branch = code_branch
 
-    # Open draft MR on first iteration (or reuse from checkpoint).
+    # Ensure CI workflow exists on code branch
+    from orchestrator.ci_generator import ensure_target_ci_workflow
+
+    repo_id = getattr(gitlab, "project_id", None) or getattr(gitlab, "repo_name", "target-repo")
+    ensure_target_ci_workflow(
+        gitlab=gitlab,
+        branch=code_branch,
+        repo_identifier=repo_id,
+        all_file_paths=context.all_file_paths,
+    )
+
+    # Open draft PR/MR on first iteration (or reuse from checkpoint).
     if checkpoint.draft_mr_iid is None:
+        logger.info("Creating draft PR for code generation…")
         mr_info = gitlab.create_mr(
             source_branch=code_branch,
             target_branch=context.default_branch,
@@ -95,6 +109,13 @@ def run(
     # Collect locked test paths for commit blocking.
     locked_paths = set(checkpoint.locked_test_hashes.keys())
 
+    # Ensure context.test_files contains the locked tests from tests_branch
+    if not context.test_files and locked_paths:
+        locked_test_contents = _fetch_locked_test_contents(
+            gitlab, checkpoint.tests_branch or code_branch, locked_paths
+        )
+        context.test_files.update(locked_test_contents)
+
     # Build initial source snapshot from context.
     current_sources: dict[str, str] = dict(context.source_files)
     last_test_output = ""
@@ -113,7 +134,9 @@ def run(
             payload={"iteration": iteration},
         )
 
-        # ── 1. Prompt the LLM ──────────────────────────────────────────
+        # ── 1. Prompt the LLM ────────────────────────────────────────
+        logger.info("LLM call: generating code changes…")
+        t0 = _time.monotonic()
         generated_files = _generate_code(
             llm=llm,
             context=context,
@@ -122,6 +145,8 @@ def run(
             iteration=iteration,
             locked_paths=locked_paths,
         )
+        elapsed = _time.monotonic() - t0
+        logger.info("LLM responded in %.1fs with %d file(s)", elapsed, len(generated_files) if generated_files else 0)
 
         if not generated_files:
             logger.warning("LLM returned no file changes in iteration %d", iteration)
@@ -132,7 +157,8 @@ def run(
             )
             continue
 
-        # ── 2. Commit changes ──────────────────────────────────────────
+        # ── 2. Commit changes ────────────────────────────────────────
+        logger.info("Committing %d file(s) to branch %s", len(generated_files), code_branch)
         commit_sha = gitlab.commit_files(
             branch=code_branch,
             files=generated_files,
@@ -142,7 +168,7 @@ def run(
             ),
             blocked_paths=locked_paths,
         )
-        logger.info("Committed %d file(s): %s", len(generated_files), commit_sha[:10])
+        logger.info("Commit successful")
 
         # Update current source snapshot.
         current_sources.update(generated_files)
@@ -150,10 +176,13 @@ def run(
             set(checkpoint.modified_files) | set(generated_files.keys())
         )
 
-        # ── 3. Trigger Jest (test-only CI run) ─────────────────────────
+        # ── 3. Trigger CI/CD (test-only run) ─────────────────────────
+        logger.info("Triggering CI test run…")
         pipeline_id = trigger_ci(
-            gitlab, code_branch,
+            gitlab,
+            code_branch,
             variables={"TEST_ONLY": "true"},
+            commit_sha=commit_sha,
         )
         checkpoint.ci_pipeline_id = pipeline_id
         checkpoint.save(checkpoint_dir=_infer_checkpoint_dir(checkpoint))
@@ -164,7 +193,8 @@ def run(
             timeout_minutes=ci_timeout_minutes,
         )
 
-        # ── 4. Tamper-check locked test files ──────────────────────────
+        # ── 4. Tamper-check locked test files ──────────────────────
+        logger.info("Verifying locked test file integrity…")
         current_test_contents = _fetch_locked_test_contents(
             gitlab, code_branch, locked_paths,
         )
@@ -200,7 +230,7 @@ def run(
         # ── 5. Parse test results ──────────────────────────────────────
         test_results = _parse_ci_test_results(ci_result)
         checkpoint.last_test_results = test_results
-        last_test_output = _format_test_output(ci_result, test_results)
+        last_test_output = _format_test_output(ci_result, test_results, gitlab=gitlab)
 
         audit.log(
             stage=3,
@@ -286,18 +316,22 @@ def _generate_code(
     # Previous iteration context.
     iteration_context = ""
     if last_test_output and iteration > 1:
+        test_lines = last_test_output.strip().splitlines()
+        if len(test_lines) > 100:
+            truncated_output = "\n".join(test_lines[:100]) + "\n... [truncated for token brevity]"
+        else:
+            truncated_output = last_test_output.strip()
         iteration_context = (
             f"## Previous Iteration Test Results\n"
-            f"```\n{last_test_output}\n```\n\n"
+            f"```\n{truncated_output}\n```\n\n"
             f"The above tests failed in the previous iteration. "
             f"Analyse the failures and try a different approach.\n\n"
         )
 
     prompt = (
-        "You are a senior software engineer specialising in JavaScript/TypeScript, "
-        "React, and Redux.  Your task is to implement code changes that make the "
-        "locked test suite pass.\n\n"
-        "## JIRA Ticket\n"
+        "You are a senior software engineer.  Your task is to implement code "
+        "changes that make the locked test suite pass.\n\n"
+        "## Ticket\n"
         f"**ID:** {ticket.ticket_id}\n"
         f"**Summary:** {ticket.summary}\n"
         f"**Description:**\n{ticket.description}\n\n"
@@ -309,7 +343,8 @@ def _generate_code(
         "1. You MUST NOT modify any locked test file. They are immutable.\n"
         "2. Only create or modify source files.\n"
         "3. Your code must make all the locked tests pass.\n"
-        "4. Follow existing code conventions and patterns.\n\n"
+        "4. Follow existing code conventions and patterns.\n"
+        "5. In React components, ensure hooks that require external providers (such as useNavigate from react-router) are safely handled with a fallback (e.g. let navigate = () => {}; try { navigate = useNavigate(); } catch (e) {}) so components can be rendered in isolated unit tests without throwing.\n\n"
         "## Output Format\n"
         "Return your answer as one or more fenced code blocks, each preceded by "
         "a single-line file path comment like:\n"
@@ -354,47 +389,61 @@ def _parse_generated_files(llm_output: str) -> dict[str, str]:
     """
     Parse the LLM's response into ``{file_path: content}`` pairs.
 
-    Same format as Stage 2's ``_parse_test_files``.
+    Supports:
+      - ``// FILE: path``, ``# FILE: path``, ``/* FILE: path */``
+      - ``// filepath: path``, ``// filename: path``
+      - Markdown headers like ``### `path` ``
+      - Both fenced (```) and unfenced code outputs
     """
     files: dict[str, str] = {}
-    lines = llm_output.split("\n")
+    lines = llm_output.splitlines()
     current_path: str | None = None
     current_content: list[str] = []
-    in_code_block = False
+
+    prefixes = ("// FILE:", "# FILE:", "/* FILE:", "// filepath:", "// filename:", "# filepath:", "# filename:")
 
     for line in lines:
         stripped = line.strip()
 
-        if stripped.startswith("// FILE:"):
+        # Check for file marker
+        is_marker = False
+        target_path = None
+
+        for prefix in prefixes:
+            if stripped.lower().startswith(prefix.lower()):
+                raw = stripped[len(prefix):].removesuffix("*/").strip().strip("`'\"")
+                if raw:
+                    is_marker = True
+                    target_path = raw.replace("\\", "/")
+                    break
+
+        if not is_marker and (stripped.startswith("### `") or stripped.startswith("## `")) and stripped.endswith("`"):
+            raw = stripped.lstrip("#").strip().strip("`'\"")
+            if "." in raw:  # looks like a file path
+                is_marker = True
+                target_path = raw.replace("\\", "/")
+
+        if is_marker and target_path:
             if current_path and current_content:
-                files[current_path] = "\n".join(current_content)
-            current_path = stripped.removeprefix("// FILE:").strip()
+                files[current_path] = "\n".join(current_content).strip()
+            current_path = target_path
             current_content = []
-            in_code_block = False
             continue
 
-        if stripped.startswith("```"):
-            if in_code_block:
-                in_code_block = False
-                if current_path and current_content:
-                    files[current_path] = "\n".join(current_content)
-                    current_content = []
+        if current_path is not None:
+            # Skip code fence lines like ``` or ```typescript
+            if stripped.startswith("```"):
                 continue
-            else:
-                in_code_block = True
-                continue
-
-        if in_code_block and current_path is not None:
             current_content.append(line)
 
     if current_path and current_content:
-        files[current_path] = "\n".join(current_content)
+        files[current_path] = "\n".join(current_content).strip()
 
     return files
 
 
 def _fetch_locked_test_contents(
-    gitlab: GitLabClient,
+    gitlab: Any,
     branch: str,
     locked_paths: set[str],
 ) -> dict[str, str]:
@@ -417,32 +466,65 @@ def _parse_ci_test_results(ci_result: CIResult) -> dict[str, Any]:
     from the pipeline and job statuses.
     """
     test_job_status = ci_result.job_status("test")
+    is_passed = test_job_status in ("success", "passed") and ci_result.status in ("success", "passed")
+    is_failed = test_job_status in ("failed", "failure") or ci_result.status in ("failed", "failure")
 
     return {
-        "passed": 1 if test_job_status == "success" else 0,
-        "failed": 1 if test_job_status == "failed" else 0,
+        "passed": 1 if is_passed else 0,
+        "failed": 1 if is_failed else 0,
         "ci_status": ci_result.status,
         "test_job_status": test_job_status or "unknown",
         "details": f"Pipeline {ci_result.pipeline_id}: {ci_result.status}",
     }
 
 
-def _format_test_output(ci_result: CIResult, test_results: dict[str, Any]) -> str:
-    """Format a human-readable summary of the test results."""
+def _format_test_output(
+    ci_result: CIResult,
+    test_results: dict[str, Any],
+    gitlab: Any = None,
+) -> str:
+    """Format a human-readable summary of the test results, including live CI logs if tests failed."""
     lines = [
         f"Pipeline {ci_result.pipeline_id}: {ci_result.status}",
         f"Pipeline URL: {ci_result.web_url}",
         "",
         "Job Results:",
     ]
+    test_job_id = None
     for job in ci_result.jobs:
         lines.append(f"  - {job.get('name', '?')}: {job.get('status', '?')}")
+        if job.get("name") == "test":
+            test_job_id = job.get("id")
 
     lines.append("")
     lines.append(
         f"Test Summary: passed={test_results.get('passed', 0)}, "
         f"failed={test_results.get('failed', 0)}"
     )
+
+    # If test failed and gitlab client supports fetching job traces, include recent container logs
+    has_failed = (
+        test_results.get("failed", 0) > 0
+        or ci_result.status in ("failed", "failure")
+        or any(j.get("status") in ("failed", "failure") for j in ci_result.jobs)
+    )
+    if (
+        has_failed
+        and gitlab
+        and test_job_id
+        and hasattr(gitlab, "get_job_trace")
+    ):
+        try:
+            trace = gitlab.get_job_trace(test_job_id)
+            if trace:
+                trace_lines = trace.strip().splitlines()
+                # Include last 80 lines of the trace
+                snippet = "\n".join(trace_lines[-80:])
+                lines.append("\nTarget Test Failure Logs (from CI container):")
+                lines.append(snippet)
+        except Exception as exc:
+            logger.debug("Could not fetch test job trace: %s", exc)
+
     return "\n".join(lines)
 
 
@@ -461,14 +543,14 @@ def _get_blocker_assessment(llm: LLMClient, last_test_output: str) -> str:
 
 def _handle_escalation(
     ticket_id: str,
-    jira: JiraClient,
+    jira: Any,
     iterations: int,
     test_results: dict[str, Any],
     blocker: str,
     mr_url: str,
     slack_webhook_url: str,
     escalation_email: str,
-    gitlab: GitLabClient,
+    gitlab: Any,
     mr_iid: int | None,
     audit: AuditLogger,
 ) -> None:

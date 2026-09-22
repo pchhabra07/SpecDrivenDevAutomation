@@ -11,6 +11,11 @@ class TestContextPruner:
         tokens = estimate_tokens(msgs)
         assert tokens == 4
 
+    def test_estimate_tokens_with_none_tool_calls(self):
+        msgs = [{"role": "assistant", "content": "hello", "tool_calls": None}]
+        tokens = estimate_tokens(msgs)
+        assert tokens == 1
+
     def test_prune_transcript_small_unchanged(self):
         history = [
             {"role": "system", "content": "You are an agent."},

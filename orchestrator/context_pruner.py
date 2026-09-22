@@ -30,9 +30,10 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
         content = msg.get("content") or ""
         total_chars += len(content)
         # Account for tool calls if any
-        for tc in msg.get("tool_calls", []):
-            fn = tc.get("function", {})
-            total_chars += len(fn.get("name", "")) + len(fn.get("arguments", ""))
+        for tc in (msg.get("tool_calls") or []):
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                total_chars += len(fn.get("name") or "") + len(fn.get("arguments") or "")
     return max(1, total_chars // 4)
 
 

@@ -45,8 +45,8 @@ class Settings(BaseSettings):
         description="GitHub repository in 'owner/repo' format for audit log shipping",
     )
     github_workflow_file: str = Field(
-        "spec-driven-dev-ci.yml",
-        description="Workflow file name for CI validation in .github/workflows/",
+        "",
+        description="Optional custom workflow file name in .github/workflows/ (defaults to <repo_name>-ci.yml)",
     )
 
     # ── JIRA (Legacy / Alternative) ─────────────────────────────────────
@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     # ── Human gate polling ─────────────────────────────────────────────
     gate_poll_interval_seconds: int = Field(
         30,
-        description="Seconds between GitLab MR approval polls",
+        description="Seconds between PR/MR approval polls",
     )
     gate_timeout_hours: float = Field(
         48.0,
@@ -169,7 +169,7 @@ class Settings(BaseSettings):
     )
     repo_mapping: str = Field(
         "{}",
-        description="JSON string mapping JIRA components/labels to GitLab project IDs",
+        description="JSON string mapping components/labels to target repository identifiers",
     )
     enable_context_pruning: bool = Field(
         True,

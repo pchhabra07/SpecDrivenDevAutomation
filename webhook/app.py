@@ -51,6 +51,23 @@ def _cleanup_old_dedup_entries() -> None:
 async def lifespan(app: FastAPI):
     """Lifecycle manager: launch the concurrent worker pool on startup."""
     global worker_pool
+    # Unconditionally silence low-level HTTP transport and wire dumps
+    for noisy in (
+        "urllib3",
+        "urllib3.connectionpool",
+        "requests",
+        "httpx",
+        "httpcore",
+        "httpcore.connection",
+        "httpcore.http11",
+        "openai",
+        "openai._base_client",
+        "github",
+        "github.Requester",
+        "git",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     settings = get_settings()
     worker_pool = ConcurrentWorkerPool(
         queue=task_queue,
@@ -63,12 +80,11 @@ async def lifespan(app: FastAPI):
     if worker_pool:
         await worker_pool.stop()
     logger.info("Webhook service shut down.")
-    logger.info("Webhook service shut down.")
 
 
 app = FastAPI(
     title="Spec-Driven Development Webhook Service",
-    description="Event-driven JIRA webhook receiver with serial task queueing.",
+    description="Event-driven GitHub and JIRA webhook receiver with concurrent task queueing.",
     version="1.0.0",
     lifespan=lifespan,
 )

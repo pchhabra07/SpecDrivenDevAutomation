@@ -1,12 +1,9 @@
 """
-Shared approval-detection logic for Human Gates 1 and 2.
+Unified approval-detection logic for Human Gates 1 and 2.
 
-Both gates work identically: an MR is opened (or promoted to ready),
-then the orchestrator polls the GitLab MR Approvals API until the
-required approvals are present or a timeout is reached.
-
-Using a single module for both gates avoids code duplication and
-ensures consistent behaviour.
+Both gates work identically across GitHub (Pull Requests) and GitLab (Merge Requests):
+an MR or PR is opened (or promoted to ready), then the orchestrator polls the
+approvals API until the required approvals are present or a timeout is reached.
 """
 
 from __future__ import annotations
@@ -15,8 +12,7 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
-
-from orchestrator.gitlab_client import GitLabClient
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

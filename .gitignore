@@ -89,3 +89,6 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+
+# Documentation & Audit Handover
+Inconsistencies.md

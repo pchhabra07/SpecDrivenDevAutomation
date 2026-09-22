@@ -1,8 +1,9 @@
 """
 Stage 1 — Assemble Ticket Context.
 
-Pulls ticket data from JIRA and the relevant source/test files from
-GitLab.  Produces a ``TicketContext`` dataclass consumed by Stage 2.
+Pulls ticket data from the issue tracker (GitHub Issues or JIRA) and
+the relevant source/test files from the VCS platform (GitHub or GitLab).
+Produces a ``TicketContext`` dataclass consumed by Stage 2.
 
 Implements FR-3, FR-4.
 """
@@ -16,8 +17,7 @@ from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
-from orchestrator.gitlab_client import GitLabClient
-from orchestrator.jira_client import JiraClient, TicketData
+from orchestrator.jira_client import TicketData
 from orchestrator.llm_client import LLMClient
 from orchestrator.repo_resolver import RepoResolver
 
@@ -88,8 +88,8 @@ def _check_qualification(ticket: TicketData) -> str | None:
 
 def run(
     ticket_id: str,
-    jira: JiraClient,
-    gitlab: GitLabClient,
+    jira: Any,
+    gitlab: Any,
     llm: LLMClient,
     checkpoint: Checkpoint,
     audit: AuditLogger,
@@ -102,11 +102,11 @@ def run(
     Parameters
     ----------
     ticket_id : str
-        The JIRA ticket key (e.g. ``PROJ-123``).
-    jira : JiraClient
-        Initialised JIRA client.
-    gitlab : GitLabClient
-        Initialised GitLab client.
+        The ticket identifier (e.g. ``PROJ-123`` or ``42``).
+    jira : Any
+        Initialised issue tracker client (``GitHubIssueClient`` or ``JiraClient``).
+    gitlab : Any
+        Initialised VCS client (``GitHubClient`` or ``GitLabClient``).
     llm : LLMClient
         Initialised LLM client (used for relevance ranking).
     checkpoint : Checkpoint
@@ -124,7 +124,8 @@ def run(
     """
     audit.log(stage=1, event_type="stage1_start")
 
-    # ── 1. Fetch ticket from JIRA ───────────────────────────────────────
+    # ── 1. Fetch ticket ─────────────────────────────────────────────────
+    logger.info("Fetching ticket %s…", ticket_id)
     ticket = jira.get_ticket(ticket_id)
     logger.info("Ticket %s: %s", ticket.ticket_id, ticket.summary)
 
@@ -164,11 +165,11 @@ def run(
 
     # ── Multi-repo resolution (Phase 5) ─────────────────────────────────
     if repo_resolver:
-        default_id = gitlab.project_id or 0
+        default_id = gitlab.project_id or ""
         target_repo_id = repo_resolver.resolve(ticket, default_repo_id=default_id)
-        if target_repo_id and target_repo_id != gitlab.project_id:
+        if target_repo_id and str(target_repo_id) != str(gitlab.project_id):
             logger.info(
-                "Switching GitLab repository from %s to %s for ticket %s",
+                "Switching repository from %s to %s for ticket %s",
                 gitlab.project_id,
                 target_repo_id,
                 ticket_id,
@@ -179,6 +180,7 @@ def run(
             checkpoint.repo_id = gitlab.project_id
 
     # ── 2. Enumerate repository file tree ───────────────────────────────
+    logger.info("Enumerating repository file tree…")
     default_branch = gitlab.get_default_branch()
     tree = gitlab.get_file_tree(ref=default_branch, recursive=True)
     all_paths = [f.path for f in tree if f.type == "blob"]
@@ -193,10 +195,11 @@ def run(
     test_paths = [p for p in all_paths if _is_test_file(p)]
     source_paths = [p for p in all_paths if _is_source_file(p) and p not in test_paths]
 
-    logger.info("Repo tree: %d total, %d source, %d test files",
+    logger.info("Found %d files: %d source, %d test",
                 len(all_paths), len(source_paths), len(test_paths))
 
     # ── 4. Fetch test file contents (always — needed for context) ──────
+    logger.info("Fetching %d test file(s)…", len(test_paths))
     test_files: dict[str, str] = {}
     for path in test_paths:
         try:
@@ -210,10 +213,12 @@ def run(
     if len(source_paths) <= 30:
         relevant_paths = source_paths
     else:
+        logger.info("Large codebase (%d files). Calling LLM to rank relevance…", len(source_paths))
         relevant_paths = _rank_relevant_files(
             llm, ticket, source_paths, max_files=30,
         )
 
+    logger.info("Fetching %d relevant source file(s)…", len(relevant_paths))
     source_files: dict[str, str] = {}
     for path in relevant_paths:
         try:
@@ -230,7 +235,8 @@ def run(
         all_file_paths=all_paths,
     )
 
-    checkpoint.current_stage = 2
+    if checkpoint.current_stage < 2:
+        checkpoint.current_stage = 2
     audit.log(
         stage=1,
         event_type="stage1_complete",
@@ -274,8 +280,8 @@ def _rank_relevant_files(
     """
     paths_text = "\n".join(paths)
     prompt = (
-        "You are a code analysis assistant.  Given the following JIRA ticket "
-        "and a list of file paths in a JavaScript/TypeScript/React repository, "
+        "You are a code analysis assistant.  Given the following ticket "
+        "and a list of file paths in a repository, "
         "return the paths most likely to need changes to resolve this ticket.\n\n"
         f"## Ticket\n"
         f"**Summary:** {ticket.summary}\n"
@@ -306,5 +312,5 @@ def _rank_relevant_files(
             if len(selected) >= max_files:
                 break
 
-    logger.info("LLM-ranked %d relevant source files (from %d total)", len(selected), len(paths))
+    logger.info("LLM ranked %d relevant files from %d candidates", len(selected), len(paths))
     return selected

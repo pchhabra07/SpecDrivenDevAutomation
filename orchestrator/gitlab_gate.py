@@ -41,40 +41,25 @@ class GateTimeoutError(Exception):
 
 
 def wait_for_approval(
-    gitlab: GitLabClient,
+    gitlab: Any,
     mr_iid: int,
     poll_interval_seconds: int = 30,
     timeout_hours: float = 48.0,
     return_on_changes_requested: bool = False,
 ) -> GateResult:
     """
-    Poll a GitLab MR's approval state until it is approved or times out.
-
-    Parameters
-    ----------
-    gitlab:
-        Initialised ``GitLabClient``.
-    mr_iid:
-        The merge-request internal ID to poll.
-    poll_interval_seconds:
-        Seconds between successive API polls.
-    timeout_hours:
-        Maximum hours to wait before raising ``GateTimeoutError``.
-    return_on_changes_requested:
-        If True, return immediately with CHANGES_REQUESTED when reviewer comments
-        are detected on an unapproved MR.
-
-    Returns
-    -------
-    GateResult
-        Contains outcome, approver usernames, and any non-system comments
-        posted since the MR was opened.
+    Poll a GitLab MR or GitHub PR approval state until it is approved or times out.
     """
     deadline = time.monotonic() + (timeout_hours * 3600)
-    logger.info("Waiting for approval on MR !%d (timeout=%.1fh)", mr_iid, timeout_hours)
+    logger.info("Waiting for approval on MR/PR #%d (timeout=%.1fh)", mr_iid, timeout_hours)
 
     while time.monotonic() < deadline:
-        approvals = gitlab.get_mr_approvals(mr_iid)
+        if hasattr(gitlab, "get_mr_approvals"):
+            approvals = gitlab.get_mr_approvals(mr_iid)
+        elif hasattr(gitlab, "get_pr_approvals"):
+            approvals = gitlab.get_pr_approvals(mr_iid)
+        else:
+            approvals = {}
 
         if approvals.get("approved"):
             comments = _fetch_comments(gitlab, mr_iid)
@@ -83,34 +68,48 @@ def wait_for_approval(
                 approved_by=approvals.get("approved_by", []),
                 reviewer_comments=comments,
             )
-            logger.info("MR !%d APPROVED by %s", mr_iid, result.approved_by)
+            logger.info("MR/PR #%d APPROVED by %s", mr_iid, result.approved_by)
             return result
+
+        if approvals.get("changes_requested") and return_on_changes_requested:
+            comments = _fetch_comments(gitlab, mr_iid)
+            logger.info("MR/PR #%d CHANGES_REQUESTED detected", mr_iid)
+            return GateResult(
+                outcome=GateOutcome.CHANGES_REQUESTED,
+                approved_by=[],
+                reviewer_comments=comments,
+            )
 
         # Check for reviewer comments that might signal change requests.
         comments = _fetch_comments(gitlab, mr_iid)
         if comments:
             logger.info(
-                "MR !%d has %d reviewer comment(s) but is not yet approved.",
+                "MR/PR #%d has %d reviewer comment(s) but is not yet approved.",
                 mr_iid,
                 len(comments),
             )
             if return_on_changes_requested:
-                logger.info("Returning early on reviewer feedback for MR !%d", mr_iid)
+                logger.info("Returning early on reviewer feedback for MR/PR #%d", mr_iid)
                 return GateResult(
                     outcome=GateOutcome.CHANGES_REQUESTED,
                     approved_by=[],
                     reviewer_comments=comments,
                 )
 
-        logger.debug("MR !%d not yet approved — polling again in %ds", mr_iid, poll_interval_seconds)
+        logger.debug("MR/PR #%d not yet approved — polling again in %ds", mr_iid, poll_interval_seconds)
         time.sleep(poll_interval_seconds)
 
     raise GateTimeoutError(
-        f"MR !{mr_iid} was not approved within {timeout_hours}h"
+        f"MR/PR #{mr_iid} was not approved within {timeout_hours}h"
     )
 
 
-def _fetch_comments(gitlab: GitLabClient, mr_iid: int) -> list[str]:
-    """Return non-system comment bodies from the MR."""
-    notes = gitlab.get_mr_notes(mr_iid)
-    return [n["body"] for n in notes if not n.get("system")]
+def _fetch_comments(gitlab: Any, mr_iid: int) -> list[str]:
+    """Return non-system comment bodies from the MR or PR."""
+    if hasattr(gitlab, "get_mr_notes"):
+        notes = gitlab.get_mr_notes(mr_iid)
+    elif hasattr(gitlab, "get_pr_notes"):
+        notes = gitlab.get_pr_notes(mr_iid)
+    else:
+        notes = []
+    return [n["body"] for n in notes if not n.get("system") and n.get("body")]

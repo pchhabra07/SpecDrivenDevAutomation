@@ -9,27 +9,60 @@ that match the values agreed in the implementation plan.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
+from typing_extensions import Self
 
 
 class Settings(BaseSettings):
     """All orchestrator configuration — loaded from env vars."""
 
-    # ── JIRA ────────────────────────────────────────────────────────────
-    jira_base_url: str = Field(..., description="JIRA instance root URL")
-    jira_api_token: str = Field(..., description="JIRA API token (secret)")
-    jira_user_email: str = Field(..., description="JIRA user email for basic auth")
-    jira_project_key: str = Field(..., description="JIRA project key filter")
+    # ── Platform Selection ──────────────────────────────────────────────
+    platform: str = Field(
+        "github",
+        description="Active issue tracker and VCS platform: 'github' or 'gitlab_jira'",
+    )
+
+    # ── GitHub (Default) ────────────────────────────────────────────────
+    github_token: str = Field(
+        "",
+        description="GitHub Personal Access Token or GitHub App Token (secret)",
+    )
+    github_repo: str = Field(
+        "",
+        description="Target GitHub repository in 'owner/repo' format",
+    )
+    github_base_url: str = Field(
+        "https://api.github.com",
+        description="GitHub REST API base URL (override for GitHub Enterprise)",
+    )
+    github_webhook_secret: str = Field(
+        "",
+        description="Shared secret for validating incoming GitHub webhooks via HMAC-SHA256",
+    )
+    github_audit_repo: str = Field(
+        "",
+        description="GitHub repository in 'owner/repo' format for audit log shipping",
+    )
+    github_workflow_file: str = Field(
+        "spec-driven-dev-ci.yml",
+        description="Workflow file name for CI validation in .github/workflows/",
+    )
+
+    # ── JIRA (Legacy / Alternative) ─────────────────────────────────────
+    jira_base_url: str = Field("", description="JIRA instance root URL")
+    jira_api_token: str = Field("", description="JIRA API token (secret)")
+    jira_user_email: str = Field("", description="JIRA user email for basic auth")
+    jira_project_key: str = Field("", description="JIRA project key filter")
     qualifying_label: str = Field(
         "SpecDrivenDev",
         description="Only tickets carrying this label are eligible for automation",
     )
 
-    # ── GitLab ──────────────────────────────────────────────────────────
-    gitlab_base_url: str = Field(..., description="GitLab instance URL")
-    gitlab_api_token: str = Field(..., description="GitLab personal/project token (secret)")
-    gitlab_repo_id: int = Field(..., description="Target repo numeric ID")
+    # ── GitLab (Legacy / Alternative) ───────────────────────────────────
+    gitlab_base_url: str = Field("", description="GitLab instance URL")
+    gitlab_api_token: str = Field("", description="GitLab personal/project token (secret)")
+    gitlab_repo_id: int = Field(0, description="Target repo numeric ID")
 
     # ── NVIDIA NIM / LLM ───────────────────────────────────────────────
     nim_api_key: str = Field(..., description="NVIDIA NIM API key (secret)")
@@ -148,6 +181,35 @@ class Settings(BaseSettings):
     )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @model_validator(mode="after")
+    def validate_platform_credentials(self) -> Self:
+        if self.github_repo:
+            repo = self.github_repo.strip()
+            if "github.com" in repo:
+                repo = repo.split("github.com", 1)[1].lstrip("/:").removesuffix(".git")
+            self.github_repo = repo
+
+        if self.github_audit_repo:
+            audit_repo = self.github_audit_repo.strip()
+            if "github.com" in audit_repo:
+                audit_repo = audit_repo.split("github.com", 1)[1].lstrip("/:").removesuffix(".git")
+            self.github_audit_repo = audit_repo
+
+        has_github = bool(self.github_token and self.github_repo)
+        has_jira = bool(self.jira_base_url and self.jira_api_token and self.jira_user_email and self.jira_project_key)
+        has_gitlab = bool(self.gitlab_base_url and self.gitlab_api_token and self.gitlab_repo_id)
+
+        if self.jira_base_url and not has_jira:
+            raise ValueError("Incomplete JIRA credentials: JIRA_BASE_URL was provided but API token, email, or project key is missing.")
+
+        if self.gitlab_base_url and not has_gitlab:
+            raise ValueError("Incomplete GitLab credentials: GITLAB_BASE_URL was provided but API token or repo ID is missing.")
+
+        if not has_github and not (has_jira and has_gitlab):
+            raise ValueError("Either complete GitHub credentials (GITHUB_TOKEN, GITHUB_REPO) or complete JIRA+GitLab credentials must be provided.")
+
+        return self
 
 
 _settings: Settings | None = None

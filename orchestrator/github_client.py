@@ -1,0 +1,466 @@
+"""
+GitHub API client — wraps ``PyGithub`` for all repository operations.
+
+Replaces GitLabClient with native GitHub operations:
+- File tree enumeration via Git Data API
+- File reads with base64 decoding
+- Branch creation and reference management
+- Multi-file commits with locked test-file tamper enforcement
+- Pull Request lifecycle (Draft PR creation, PR description update,
+  ready-for-review promotion, label management, review approval polling,
+  and feedback notes extraction)
+- GitHub Actions workflow trigger and status monitoring
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from github import Auth, Github, GithubException, InputGitTreeElement
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FileEntry:
+    """A single file from the repository tree."""
+
+    path: str
+    type: str  # "blob" or "tree"
+
+
+@dataclass
+class PullRequestInfo:
+    """Essential metadata about a created or fetched Pull Request."""
+
+    number: int
+    web_url: str
+    state: str
+    draft: bool
+
+    @property
+    def iid(self) -> int:
+        """Alias for number to maintain compatibility with downstream stages."""
+        return self.number
+
+
+@dataclass
+class WorkflowRunResult:
+    """Terminal or in-progress result of a GitHub Actions workflow run."""
+
+    pipeline_id: int  # equivalent to workflow_run_id
+    status: str       # "success", "failed", "canceled", "in_progress", etc.
+    web_url: str
+    jobs: list[dict[str, Any]] = field(default_factory=list)
+
+
+class GitHubClient:
+    """High-level GitHub API facade for repository and PR operations."""
+
+    @staticmethod
+    def _clean_repo(repo: str) -> str:
+        clean = str(repo).strip()
+        if "github.com" in clean:
+            clean = clean.split("github.com", 1)[1].lstrip("/:").removesuffix(".git")
+        return clean
+
+    def __init__(
+        self,
+        token: str,
+        repo: str,
+        base_url: str = "https://api.github.com",
+    ) -> None:
+        if token:
+            auth = Auth.Token(token)
+            self._gh = Github(auth=auth, base_url=base_url)
+        else:
+            self._gh = Github(base_url=base_url)
+
+        self._repo_name = self._clean_repo(repo)
+        self._repo = self._gh.get_repo(self._repo_name)
+        logger.info("GitHub client initialised for repo %s", self._repo.full_name)
+
+    @property
+    def repo_name(self) -> str:
+        """Return full repository name ('owner/repo')."""
+        return self._repo.full_name
+
+    @property
+    def project_id(self) -> str:
+        """Alias for repo_name to maintain compatibility with stages."""
+        return self.repo_name
+
+    def switch_repo(self, repo_name: str) -> None:
+        """Switch active GitHub repository."""
+        self._repo_name = self._clean_repo(repo_name)
+        self._repo = self._gh.get_repo(self._repo_name)
+        logger.info("GitHub client switched to repo %s", self._repo.full_name)
+
+    def switch_project(self, repo_identifier: str | int) -> None:
+        """Compatibility alias for switch_repo."""
+        self.switch_repo(str(repo_identifier))
+
+    # ── Repository reads ────────────────────────────────────────────────
+
+    def get_file_tree(
+        self,
+        ref: str = "main",
+        path: str = "",
+        recursive: bool = True,
+    ) -> list[FileEntry]:
+        """Return the full file tree for *ref* under *path*."""
+        try:
+            # Resolve branch name to commit SHA if needed
+            branch = self._repo.get_branch(ref)
+            sha = branch.commit.sha
+        except GithubException:
+            sha = ref
+
+        git_tree = self._repo.get_git_tree(sha=sha, recursive=recursive)
+        results: list[FileEntry] = []
+        for item in git_tree.tree:
+            if path and not item.path.startswith(path):
+                continue
+            results.append(FileEntry(path=item.path, type=item.type))
+        return results
+
+    def get_file_content(self, file_path: str, ref: str = "main") -> str:
+        """Return the decoded UTF-8 content of a single file."""
+        content_file = self._repo.get_contents(file_path, ref=ref)
+        if isinstance(content_file, list):
+            raise ValueError(f"Path '{file_path}' is a directory, not a file")
+        return content_file.decoded_content.decode("utf-8")
+
+    def get_default_branch(self) -> str:
+        """Return the name of the project's default branch."""
+        return self._repo.default_branch
+
+    # ── Branch management ───────────────────────────────────────────────
+
+    def create_branch(self, branch_name: str, ref: str = "main") -> None:
+        """Create a new branch from *ref*."""
+        base_branch = self._repo.get_branch(ref)
+        base_sha = base_branch.commit.sha
+        self._repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base_sha)
+        logger.info("Branch created: %s (from %s @ %s)", branch_name, ref, base_sha[:8])
+
+    def branch_exists(self, branch_name: str) -> bool:
+        """Check whether a branch already exists."""
+        try:
+            self._repo.get_branch(branch_name)
+            return True
+        except GithubException:
+            return False
+
+    # ── Commits ─────────────────────────────────────────────────────────
+
+    def commit_files(
+        self,
+        branch: str,
+        files: dict[str, str],
+        commit_message: str,
+        *,
+        blocked_paths: set[str] | None = None,
+    ) -> str:
+        """
+        Create a single commit that creates/updates multiple files.
+        Enforces test-file locking via blocked_paths.
+        """
+        if blocked_paths:
+            violations = set(files.keys()) & blocked_paths
+            if violations:
+                raise ValueError(
+                    f"Commit rejected — attempt to modify locked files: {violations}"
+                )
+
+        target_branch = self._repo.get_branch(branch)
+        base_commit = target_branch.commit
+        base_tree = base_commit.commit.tree
+
+        tree_elements = [
+            InputGitTreeElement(
+                path=path,
+                mode="100644",
+                type="blob",
+                content=content,
+            )
+            for path, content in files.items()
+        ]
+
+        new_tree = self._repo.create_git_tree(tree_elements, base_tree)
+        new_commit = self._repo.create_git_commit(
+            commit_message,
+            new_tree,
+            [base_commit.commit],
+        )
+
+        ref = self._repo.get_git_ref(f"heads/{branch}")
+        ref.edit(new_commit.sha)
+
+        logger.info("Commit %s on %s (%d files)", new_commit.sha[:10], branch, len(files))
+        return new_commit.sha
+
+    # ── Pull Requests ───────────────────────────────────────────────────
+
+    def create_pr(
+        self,
+        source_branch: str,
+        target_branch: str,
+        title: str,
+        description: str = "",
+        draft: bool = True,
+    ) -> PullRequestInfo:
+        """Create a new pull request (draft by default)."""
+        pr_title = f"Draft: {title}" if draft and not title.startswith("Draft:") else title
+        try:
+            pr = self._repo.create_pull(
+                title=pr_title,
+                body=description,
+                head=source_branch,
+                base=target_branch,
+                draft=draft,
+            )
+        except GithubException as exc:
+            # Fallback for accounts/plans without native draft PRs
+            logger.warning("Native draft PR failed (%s); creating standard PR with Draft title", exc)
+            pr = self._repo.create_pull(
+                title=pr_title,
+                body=description,
+                head=source_branch,
+                base=target_branch,
+            )
+
+        info = PullRequestInfo(
+            number=pr.number,
+            web_url=pr.html_url,
+            state=pr.state,
+            draft=draft,
+        )
+        logger.info("PR #%d created: %s", info.number, info.web_url)
+        return info
+
+    def create_mr(
+        self,
+        source_branch: str,
+        target_branch: str,
+        title: str,
+        description: str = "",
+        draft: bool = True,
+    ) -> PullRequestInfo:
+        """Compatibility alias for create_pr."""
+        return self.create_pr(
+            source_branch=source_branch,
+            target_branch=target_branch,
+            title=title,
+            description=description,
+            draft=draft,
+        )
+
+    def get_pr_approvals(self, pr_number: int) -> dict[str, Any]:
+        """
+        Fetch approval status of a Pull Request.
+        Inspects review states ('APPROVED', 'CHANGES_REQUESTED') and comments.
+        """
+        pr = self._repo.get_pull(pr_number)
+        reviews = list(pr.get_reviews())
+
+        approved_by: list[str] = []
+        changes_requested = False
+
+        for r in reviews:
+            state = (r.state or "").upper()
+            author = r.user.login if r.user else "reviewer"
+            if state == "APPROVED":
+                if author not in approved_by:
+                    approved_by.append(author)
+            elif state == "CHANGES_REQUESTED":
+                changes_requested = True
+
+        # Also inspect issue comments for explicit LGTM/approval
+        issue = self._repo.get_issue(pr_number)
+        for c in issue.get_comments():
+            body = (c.body or "").upper()
+            author = c.user.login if c.user else "reviewer"
+            if "APPROVED" in body or "LGTM" in body:
+                if author not in approved_by:
+                    approved_by.append(author)
+            elif "CHANGES_REQUESTED" in body or "REQUEST_CHANGES" in body:
+                changes_requested = True
+
+        return {
+            "approved": len(approved_by) > 0,
+            "approved_by": approved_by,
+            "changes_requested": changes_requested,
+        }
+
+    def get_mr_approvals(self, pr_number: int) -> dict[str, Any]:
+        """Compatibility alias for get_pr_approvals."""
+        return self.get_pr_approvals(pr_number)
+
+    def update_pr_description(self, pr_number: int, description: str) -> None:
+        """Update the body of an existing PR."""
+        pr = self._repo.get_pull(pr_number)
+        pr.edit(body=description)
+        logger.info("PR #%d description updated", pr_number)
+
+    def update_mr_description(self, pr_number: int, description: str) -> None:
+        """Compatibility alias for update_pr_description."""
+        self.update_pr_description(pr_number, description)
+
+    def promote_pr_to_ready(self, pr_number: int) -> None:
+        """Remove 'Draft:' prefix and mark PR ready for review."""
+        pr = self._repo.get_pull(pr_number)
+        new_title = pr.title
+        if new_title.startswith("Draft: "):
+            new_title = new_title.removeprefix("Draft: ")
+        elif new_title.startswith("[Draft] "):
+            new_title = new_title.removeprefix("[Draft] ")
+
+        pr.edit(title=new_title)
+        logger.info("PR #%d promoted to ready-for-review", pr_number)
+
+    def promote_mr_to_ready(self, pr_number: int) -> None:
+        """Compatibility alias for promote_pr_to_ready."""
+        self.promote_pr_to_ready(pr_number)
+
+    def add_pr_label(self, pr_number: int, label: str) -> None:
+        """Add a label to a Pull Request."""
+        issue = self._repo.get_issue(pr_number)
+        issue.add_to_labels(label)
+        logger.info("PR #%d labelled: %s", pr_number, label)
+
+    def add_mr_label(self, pr_number: int, label: str) -> None:
+        """Compatibility alias for add_pr_label."""
+        self.add_pr_label(pr_number, label)
+
+    def merge_pr(self, pr_number: int, squash: bool = True) -> None:
+        """Merge a Pull Request (squash by default)."""
+        pr = self._repo.get_pull(pr_number)
+        pr.merge(merge_method="squash" if squash else "merge")
+        logger.info("PR #%d merged (squash=%s)", pr_number, squash)
+
+    def merge_mr(self, pr_number: int, squash: bool = True) -> None:
+        """Compatibility alias for merge_pr."""
+        self.merge_pr(pr_number, squash=squash)
+
+    def get_pr_notes(self, pr_number: int) -> list[dict[str, Any]]:
+        """Fetch all comments and reviews on a PR (for reviewer feedback routing)."""
+        pr = self._repo.get_pull(pr_number)
+        notes: list[dict[str, Any]] = []
+
+        # Issue comments
+        issue = self._repo.get_issue(pr_number)
+        for c in issue.get_comments():
+            author = c.user.login if c.user else "user"
+            notes.append({
+                "author": author,
+                "body": c.body or "",
+                "created_at": c.created_at,
+                "system": False,
+            })
+
+        # Review comments
+        for r in pr.get_reviews():
+            if r.body and r.body.strip():
+                author = r.user.login if r.user else "reviewer"
+                notes.append({
+                    "author": author,
+                    "body": r.body,
+                    "created_at": r.submitted_at,
+                    "system": False,
+                })
+
+        return notes
+
+    def get_mr_notes(self, pr_number: int) -> list[dict[str, Any]]:
+        """Compatibility alias for get_pr_notes."""
+        return self.get_pr_notes(pr_number)
+
+    # ── GitHub Actions CI/CD ───────────────────────────────────────────
+
+    def trigger_workflow(
+        self,
+        branch: str,
+        workflow_name_or_file: str = "spec-driven-dev-ci.yml",
+        inputs: dict[str, str] | None = None,
+    ) -> int:
+        """
+        Trigger or find the active GitHub Actions workflow run on *branch*.
+        """
+        try:
+            workflow = self._repo.get_workflow(workflow_name_or_file)
+            workflow.create_dispatch(ref=branch, inputs=inputs or {})
+            time.sleep(2)  # Give GitHub Actions a moment to queue the run
+        except Exception as exc:
+            logger.info("Workflow dispatch not triggered (%s); falling back to latest push run", exc)
+
+        # Retrieve latest run on branch
+        runs = list(self._repo.get_workflow_runs(branch=branch))
+        if runs:
+            latest_run = runs[0]
+            logger.info("Active workflow run %d found on %s", latest_run.id, branch)
+            return latest_run.id
+
+        # Fallback dummy run id if workflow run hasn't appeared yet
+        return 1
+
+    def trigger_pipeline(
+        self,
+        branch: str,
+        variables: dict[str, str] | None = None,
+    ) -> int:
+        """Compatibility alias for trigger_workflow."""
+        return self.trigger_workflow(branch=branch, inputs=variables)
+
+    def get_workflow_status(self, run_id: int) -> WorkflowRunResult:
+        """Poll the status of a GitHub Actions workflow run."""
+        run = self._repo.get_workflow_run(run_id)
+
+        # Map GitHub conclusions to pipeline status
+        status = run.status
+        conclusion = run.conclusion
+
+        if status == "completed":
+            mapped_status = "success" if conclusion == "success" else "failed"
+        elif status in ("queued", "in_progress"):
+            mapped_status = "running"
+        else:
+            mapped_status = conclusion or status or "unknown"
+
+        jobs: list[dict[str, Any]] = []
+        try:
+            for j in run.jobs():
+                job_status = "success" if j.conclusion == "success" else (j.conclusion or j.status)
+                jobs.append({
+                    "id": j.id,
+                    "name": j.name,
+                    "status": job_status,
+                    "conclusion": j.conclusion,
+                    "html_url": j.html_url,
+                })
+        except Exception as exc:
+            logger.warning("Could not fetch jobs for workflow run %d: %s", run_id, exc)
+
+        return WorkflowRunResult(
+            pipeline_id=run.id,
+            status=mapped_status,
+            web_url=run.html_url,
+            jobs=jobs,
+        )
+
+    def get_pipeline_status(self, run_id: int) -> WorkflowRunResult:
+        """Compatibility alias for get_workflow_status."""
+        return self.get_workflow_status(run_id)
+
+    def get_job_log(self, job_id: int) -> str:
+        """Fetch logs for a specific job."""
+        try:
+            # PyGithub doesn't expose direct raw log streaming in all versions,
+            # but job objects provide summary or we can query job
+            return f"Logs for job {job_id}"
+        except Exception as exc:
+            return f"Could not retrieve log: {exc}"

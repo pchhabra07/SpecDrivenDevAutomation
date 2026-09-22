@@ -151,7 +151,13 @@ def run(
     gitlab.update_mr_description(mr_iid, description)
     audit.log(stage=5, event_type="stage5_mr_promoted", payload={"mr_iid": mr_iid})
 
-    mr_url = f"{gitlab._project.web_url}/-/merge_requests/{mr_iid}"
+    if hasattr(gitlab, "_project"):
+        mr_url = f"{gitlab._project.web_url}/-/merge_requests/{mr_iid}"
+    elif hasattr(gitlab, "_repo"):
+        mr_url = f"{gitlab._repo.html_url}/pull/{mr_iid}"
+    else:
+        mr_url = f"https://github.com/pull/{mr_iid}"
+
     checkpoint.final_mr_url = mr_url
     checkpoint.gate2_mr_iid = mr_iid
 

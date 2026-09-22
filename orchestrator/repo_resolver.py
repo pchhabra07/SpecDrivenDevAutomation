@@ -18,45 +18,40 @@ logger = logging.getLogger(__name__)
 
 
 class RepoResolver:
-    """Resolves target GitLab repo/project ID for a given JIRA ticket."""
+    """Resolves target repository (GitHub 'owner/repo' or numeric project ID) for a given ticket."""
 
     def __init__(self, mapping_json: str | dict[str, Any] = "{}") -> None:
+        raw_dict = {}
         if isinstance(mapping_json, dict):
-            self._mapping: dict[str, int] = {
-                str(k).strip().lower(): int(v)
-                for k, v in mapping_json.items()
-                if str(v).isdigit()
-            }
+            raw_dict = mapping_json
         elif isinstance(mapping_json, str):
             try:
                 raw = json.loads(mapping_json or "{}")
                 if isinstance(raw, dict):
-                    self._mapping = {
-                        str(k).strip().lower(): int(v)
-                        for k, v in raw.items()
-                        if str(v).isdigit()
-                    }
+                    raw_dict = raw
                 else:
                     logger.warning("REPO_MAPPING is not a JSON object: %s", mapping_json)
-                    self._mapping = {}
             except Exception as exc:
                 logger.warning(
                     "Failed to parse REPO_MAPPING JSON: %s (err: %s)",
                     mapping_json,
                     exc,
                 )
-                self._mapping = {}
-        else:
-            self._mapping = {}
+
+        self._mapping: dict[str, Any] = {}
+        for k, v in raw_dict.items():
+            key = str(k).strip().lower()
+            val = int(v) if str(v).isdigit() else str(v).strip()
+            self._mapping[key] = val
 
     @property
-    def mapping(self) -> dict[str, int]:
+    def mapping(self) -> dict[str, Any]:
         """Return read-only copy of parsed repository mapping."""
         return dict(self._mapping)
 
-    def resolve(self, ticket: TicketData, default_repo_id: int) -> int:
+    def resolve(self, ticket: TicketData, default_repo_id: Any) -> Any:
         """
-        Determine the GitLab project ID for a ticket.
+        Determine the repository target for a ticket.
 
         Matching priority:
         1. Exact match on JIRA component name (case-insensitive).
@@ -95,13 +90,15 @@ class RepoResolver:
                         label,
                     )
                     return matched_id
-                # Prefix match: e.g. "repo:auth-service" or "repo:98765"
+                # Prefix match: e.g. "repo:auth-service", "repo:98765", or "repo:org/repo"
                 if norm_label.startswith("repo:"):
                     target = norm_label[5:].strip()
                     if target.isdigit():
                         return int(target)
                     if target in self._mapping:
                         return self._mapping[target]
+                    if "/" in target:
+                        return target
 
         # 3. Match by ticket project key (e.g. "PROJ" from "PROJ-123")
         if "-" in ticket.ticket_id:
@@ -117,7 +114,7 @@ class RepoResolver:
                 return matched_id
 
         logger.debug(
-            "No custom repo match found for ticket %s; using default repo ID %d",
+            "No custom repo match found for ticket %s; using default repo ID %s",
             ticket.ticket_id,
             default_repo_id,
         )

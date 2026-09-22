@@ -110,6 +110,13 @@ def build_escalation_message(
     )
 
 
+def _platform_names(url: str) -> tuple[str, str]:
+    """Return (platform_name, pr_type_name) based on URL."""
+    if "github" in (url or "").lower():
+        return "GitHub", "Pull Request"
+    return "GitLab", "Merge Request"
+
+
 def notify_gate1_pending(
     slack_webhook_url: str,
     escalation_email: str,
@@ -118,11 +125,12 @@ def notify_gate1_pending(
     test_count: int,
 ) -> None:
     """Notify reviewer that Gate 1 tests are generated and ready for approval."""
+    plat, pr_name = _platform_names(mr_url)
     msg = (
         f"📝 *Gate 1 Review Required — {ticket_id}*\n"
         f"The Spec-Driven Development agent generated {test_count} test file(s) "
         f"derived from the ticket's acceptance criteria.\n"
-        f"Please review and approve the tests on GitLab: {mr_url}"
+        f"Please review and approve the tests on {plat}: {mr_url}"
     )
     if slack_webhook_url:
         notify_slack(slack_webhook_url, msg)
@@ -137,13 +145,14 @@ def notify_gate2_pending(
     mr_url: str,
     gate_results_summary: str,
 ) -> None:
-    """Notify reviewer that code changes and validation gates passed and MR is ready."""
+    """Notify reviewer that code changes and validation gates passed and MR/PR is ready."""
+    plat, pr_name = _platform_names(mr_url)
     msg = (
         f"🚀 *Gate 2 Review Required — {ticket_id}*\n"
         f"The automated pipeline has completed code generation and all CI validation gates passed!\n\n"
         f"*Quality Gates:*\n{gate_results_summary}\n\n"
-        f"*GitLab Merge Request:* {mr_url}\n"
-        f"Please review the PR and approve in GitLab."
+        f"*{plat} {pr_name}:* {mr_url}\n"
+        f"Please review the PR and approve in {plat}."
     )
     if slack_webhook_url:
         notify_slack(slack_webhook_url, msg)
@@ -158,17 +167,18 @@ def notify_gate2_approved(
     mr_url: str,
     approved_by: list[str],
 ) -> None:
-    """Notify team that Gate 2 MR was approved by a human reviewer."""
+    """Notify team that Gate 2 MR/PR was approved by a human reviewer."""
+    plat, pr_name = _platform_names(mr_url)
     users_str = ", ".join(f"@{u}" for u in approved_by) if approved_by else "reviewer"
     msg = (
-        f"✅ *MR Approved — {ticket_id}*\n"
-        f"GitLab MR {mr_url} has been approved by {users_str}!\n"
-        f"Ready for human merge in GitLab."
+        f"✅ *{pr_name} Approved — {ticket_id}*\n"
+        f"{plat} {pr_name} {mr_url} has been approved by {users_str}!\n"
+        f"Ready for human merge in {plat}."
     )
     if slack_webhook_url:
         notify_slack(slack_webhook_url, msg)
     if escalation_email:
-        notify_email(escalation_email, f"[Approved] {ticket_id} MR Approved", msg)
+        notify_email(escalation_email, f"[Approved] {ticket_id} {pr_name} Approved", msg)
 
 
 def notify_feedback_received(
@@ -178,11 +188,12 @@ def notify_feedback_received(
     mr_url: str,
     feedback_notes: list[str],
 ) -> None:
-    """Notify that reviewer requested changes on Gate 2 MR."""
+    """Notify that reviewer requested changes on Gate 2 MR/PR."""
+    plat, pr_name = _platform_names(mr_url)
     notes_preview = "\n- ".join(feedback_notes[:3])
     msg = (
         f"🔄 *Reviewer Feedback Received — {ticket_id}*\n"
-        f"Reviewer requested changes on GitLab MR: {mr_url}\n\n"
+        f"Reviewer requested changes on {plat} {pr_name}: {mr_url}\n\n"
         f"*Feedback summary:*\n- {notes_preview}\n\n"
         f"The agent is re-entering Stage 3 to apply corrections."
     )
@@ -199,10 +210,11 @@ def notify_pipeline_complete(
     mr_url: str,
 ) -> None:
     """Notify team that ticket pipeline has completed successfully."""
+    plat, pr_name = _platform_names(mr_url)
     msg = (
         f"🎉 *Pipeline Complete — {ticket_id}*\n"
         f"All spec-driven development stages completed for {ticket_id}.\n"
-        f"GitLab MR: {mr_url}"
+        f"{plat} {pr_name}: {mr_url}"
     )
     if slack_webhook_url:
         notify_slack(slack_webhook_url, msg)

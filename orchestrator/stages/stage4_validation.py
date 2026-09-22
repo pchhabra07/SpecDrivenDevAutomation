@@ -21,12 +21,18 @@ from typing import Any
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.ci_poller import CIResult, trigger_ci, wait_for_pipeline
-from orchestrator.gitlab_client import GitLabClient
 
 logger = logging.getLogger(__name__)
 
-# Expected CI job names in the gitlab-ci-template.yml.
+# Expected CI job names across GitLab CI and GitHub Actions
 _GATE_JOBS = ("lint", "sast", "dependency-scan", "test-coverage", "quality-gate")
+_JOB_ALIASES: dict[str, tuple[str, ...]] = {
+    "lint": ("lint", "eslint"),
+    "sast": ("sast", "security-sast", "semgrep"),
+    "dependency-scan": ("dependency-scan", "security-deps", "trivy"),
+    "test-coverage": ("test-coverage", "test", "jest"),
+    "quality-gate": ("quality-gate", "sonarqube", "sonarcloud"),
+}
 
 
 @dataclass
@@ -70,7 +76,7 @@ class ValidationResult:
 
 def run(
     code_branch: str,
-    gitlab: GitLabClient,
+    gitlab: Any,
     checkpoint: Checkpoint,
     audit: AuditLogger,
     *,
@@ -87,7 +93,7 @@ def run(
     code_branch:
         The Git branch with the code changes from Stage 3.
     gitlab:
-        Initialised ``GitLabClient``.
+        Initialised ``GitHubClient`` or ``GitLabClient``.
     checkpoint:
         Current checkpoint (updated with pipeline ID and results).
     audit:
@@ -122,17 +128,17 @@ def run(
         payload={"pipeline_id": pipeline_id, "branch": code_branch},
     )
 
-    # ── 2. Wait for pipeline completion ────────────────────────────────
-    ci_result: CIResult = wait_for_pipeline(
-        gitlab, pipeline_id,
+    # ── 2. Poll until terminal state ───────────────────────────────────
+    ci_result = wait_for_pipeline(
+        gitlab,
+        pipeline_id=pipeline_id,
         poll_interval_seconds=ci_poll_interval,
         timeout_minutes=ci_timeout_minutes,
     )
 
-    # ── 3. Map job results to gate statuses ────────────────────────────
-    gates = _map_gate_statuses(ci_result, sonar_configured)
+    # ── 3. Evaluate individual gate statuses ───────────────────────────
+    gates = _map_gate_statuses(ci_result, sonar_configured=sonar_configured)
 
-    # Log each gate result individually.
     for gate in gates:
         audit.log(
             stage=4,
@@ -145,7 +151,7 @@ def run(
             },
         )
         logger.info(
-            "  Gate %-20s: %s%s",
+            "  Gate %-18s: %s%s",
             gate.name,
             gate.status,
             "" if gate.required else " (optional)",
@@ -190,14 +196,20 @@ def _map_gate_statuses(
     ci_result: CIResult,
     sonar_configured: bool,
 ) -> list[GateStatus]:
-    """Map CI job results to structured gate statuses."""
+    """Map CI job results to structured gate statuses across GitLab and GitHub."""
     gates: list[GateStatus] = []
 
     for job_name in _GATE_JOBS:
         is_sonar = job_name == "quality-gate"
         required = not is_sonar or sonar_configured
 
-        job_status = ci_result.job_status(job_name)
+        aliases = _JOB_ALIASES.get(job_name, (job_name,))
+        job_status = None
+        for alias in aliases:
+            st = ci_result.job_status(alias)
+            if st is not None:
+                job_status = st
+                break
 
         if job_status is None:
             if is_sonar and not sonar_configured:

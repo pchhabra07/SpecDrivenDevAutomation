@@ -1,0 +1,126 @@
+name: Spec-Driven Development CI Validation
+
+on:
+  push:
+    branches:
+      - 'automation/**'
+  workflow_dispatch:
+    inputs:
+      test_only:
+        description: 'Run test job only (Stage 3 mode)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  security-events: write
+
+jobs:
+  # ── Gate 1: Code Style & Quality ────────────────────────────────────
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_only != 'true'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci || npm install
+
+      - name: Run ESLint
+        run: npx eslint . --ext .js,.jsx,.ts,.tsx --max-warnings=0
+
+  # ── Gate 2: Static Application Security Testing (SAST) ───────────────
+  security-sast:
+    name: security-sast
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_only != 'true'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+        env:
+          SEMGREP_RULES: p/javascript p/typescript
+
+  # ── Gate 3: Software Composition Analysis (SCA / Dependencies) ──────
+  security-deps:
+    name: security-deps
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_only != 'true'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+
+  # ── Gate 4: Test Suite Execution & Coverage ─────────────────────────
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci || npm install
+
+      - name: Run Jest Target Tests with Coverage
+        run: npm test -- --coverage --testResultsProcessor=jest-junit --coverageThreshold='{"global":{"lines":80}}'
+        env:
+          CI: true
+
+      - name: Upload Test Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jest-test-results
+          path: junit.xml
+
+  # ── Gate 5: SonarQube / SonarCloud Quality Gate ──────────────────────
+  sonarqube:
+    name: sonarqube
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_only != 'true' && env.SONAR_TOKEN != ''
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Quality Gate Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}

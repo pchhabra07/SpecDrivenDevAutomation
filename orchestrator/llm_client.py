@@ -44,8 +44,9 @@ class LLMClient:
         system_prompt: str = "",
         enable_context_pruning: bool = False,
         max_context_tokens: int = 16000,
+        timeout: float = 120.0,
     ) -> None:
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self._model = model
         self._fallback_model = fallback_model
         self._rate_limiter = rate_limiter

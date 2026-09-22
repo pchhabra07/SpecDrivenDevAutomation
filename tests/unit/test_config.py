@@ -68,3 +68,19 @@ class TestSettings:
             assert s.qualifying_label == "CustomLabel"
             assert s.rate_limit_cap == 10
             assert s.max_code_iterations == 3
+
+    def test_loads_github_settings(self):
+        """Settings should instantiate with GitHub configuration alone."""
+        github_env = {
+            "PLATFORM": "github",
+            "GITHUB_TOKEN": "ghp_1234567890abcdef",
+            "GITHUB_REPO": "pchhabra07/SpecDrivenDevAutomation",
+            "NIM_API_KEY": "nim-key",
+            "NIM_BASE_URL": "https://integrate.api.nvidia.com/v1",
+        }
+        with patch.dict(os.environ, github_env, clear=True):
+            s = Settings(_env_file=None)
+            assert s.platform == "github"
+            assert s.github_token == "ghp_1234567890abcdef"
+            assert s.github_repo == "pchhabra07/SpecDrivenDevAutomation"
+            assert s.github_base_url == "https://api.github.com"

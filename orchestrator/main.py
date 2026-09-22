@@ -75,17 +75,31 @@ def run_pipeline(
 
     rate_limiter = RateLimiter(max_calls=settings.rate_limit_cap)
 
-    jira = JiraClient(
-        base_url=settings.jira_base_url,
-        email=settings.jira_user_email,
-        api_token=settings.jira_api_token,
-    )
+    if settings.platform == "github" or (settings.github_token and settings.github_repo):
+        from orchestrator.github_client import GitHubClient
+        from orchestrator.github_issue_client import GitHubIssueClient
 
-    gitlab = GitLabClient(
-        base_url=settings.gitlab_base_url,
-        private_token=settings.gitlab_api_token,
-        repo_id=settings.gitlab_repo_id,
-    )
+        jira = GitHubIssueClient(
+            token=settings.github_token,
+            repo=settings.github_repo,
+            base_url=settings.github_base_url,
+        )
+        gitlab = GitHubClient(
+            token=settings.github_token,
+            repo=settings.github_repo,
+            base_url=settings.github_base_url,
+        )
+    else:
+        jira = JiraClient(
+            base_url=settings.jira_base_url,
+            email=settings.jira_user_email,
+            api_token=settings.jira_api_token,
+        )
+        gitlab = GitLabClient(
+            base_url=settings.gitlab_base_url,
+            private_token=settings.gitlab_api_token,
+            repo_id=settings.gitlab_repo_id,
+        )
 
     llm = LLMClient(
         api_key=settings.nim_api_key,

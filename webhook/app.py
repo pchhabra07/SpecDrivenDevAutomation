@@ -91,6 +91,22 @@ def verify_jira_hmac(raw_body: bytes, signature_header: str | None, secret: str)
     return hmac.compare_digest(token.lower(), expected.lower())
 
 
+def verify_github_hmac(raw_body: bytes, signature_header: str | None, secret: str) -> bool:
+    """
+    Validate HMAC-SHA256 signature from GitHub webhook (X-Hub-Signature-256).
+    Returns True if valid or if secret is unset; False if invalid.
+    """
+    if not secret:
+        return True  # If no secret is configured, authentication is bypassed
+
+    if not signature_header:
+        return False
+
+    token = signature_header.removeprefix("sha256=").strip()
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(token.lower(), expected.lower())
+
+
 @app.post("/webhooks/jira", status_code=status.HTTP_202_ACCEPTED)
 async def handle_jira_webhook(
     request: Request,
@@ -158,6 +174,88 @@ async def handle_jira_webhook(
     return {
         "status": "queued",
         "ticket_id": issue_key,
+        "queue_position": queue_pos,
+    }
+
+
+@app.post("/webhooks/github", status_code=status.HTTP_202_ACCEPTED)
+async def handle_github_webhook(
+    request: Request,
+    x_hub_signature_256: str | None = Header(None, alias="X-Hub-Signature-256"),
+    x_github_event: str | None = Header(None, alias="X-GitHub-Event"),
+) -> dict[str, Any]:
+    """
+    Receive GitHub webhook POST notifications for issues or pull requests.
+    """
+    settings = get_settings()
+    raw_body = await request.body()
+
+    # 1. HMAC Verification
+    secret = settings.github_webhook_secret
+    if secret and not verify_github_hmac(raw_body, x_hub_signature_256, secret):
+        logger.warning("Rejected GitHub webhook — invalid HMAC signature.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid HMAC signature",
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload")
+
+    # If ping event
+    if x_github_event == "ping":
+        return {"status": "pong"}
+
+    # Filter for 'issues' event
+    if x_github_event and x_github_event != "issues":
+        logger.info("Ignoring GitHub event '%s'", x_github_event)
+        return {"status": "ignored", "reason": f"unhandled_event_{x_github_event}"}
+
+    action = payload.get("action", "")
+    issue = payload.get("issue", {})
+    if not issue:
+        return {"status": "ignored", "reason": "no_issue"}
+
+    issue_number = issue.get("number")
+    if not issue_number:
+        return {"status": "ignored", "reason": "no_issue_number"}
+
+    ticket_id = str(issue_number)
+
+    # Check repository if configured
+    repository = payload.get("repository", {})
+    repo_full_name = repository.get("full_name", "")
+    if settings.github_repo and repo_full_name and settings.github_repo.lower() != repo_full_name.lower():
+        logger.debug("Ignoring issue from non-target repo %s", repo_full_name)
+        return {"status": "ignored", "reason": "repo_mismatch"}
+
+    # Check qualifying label
+    raw_labels = issue.get("labels", [])
+    labels = [lbl.get("name") if isinstance(lbl, dict) else str(lbl) for lbl in raw_labels]
+    if settings.qualifying_label and settings.qualifying_label not in labels:
+        logger.debug("GitHub Issue #%s does not carry qualifying label '%s'", ticket_id, settings.qualifying_label)
+        return {"status": "ignored", "reason": "missing_qualifying_label"}
+
+    # Deduplication check
+    updated_at = issue.get("updated_at") or payload.get("timestamp", time.time())
+    dedup_key = f"github:{ticket_id}:{action}:{updated_at}"
+    _cleanup_old_dedup_entries()
+    if dedup_key in _recent_events:
+        logger.info("Ignoring duplicate GitHub webhook for issue #%s", ticket_id)
+        return {"status": "duplicate_ignored", "ticket_id": ticket_id}
+
+    _recent_events[dedup_key] = time.time()
+
+    # Enqueue issue number for processing
+    await task_queue.put(ticket_id)
+    queue_pos = task_queue.qsize()
+    logger.info("Enqueued GitHub Issue #%s for processing (queue position: %d)", ticket_id, queue_pos)
+
+    return {
+        "status": "queued",
+        "ticket_id": ticket_id,
         "queue_position": queue_pos,
     }
 

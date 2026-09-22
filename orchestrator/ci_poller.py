@@ -15,8 +15,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from orchestrator.gitlab_client import GitLabClient, PipelineResult
-
 logger = logging.getLogger(__name__)
 
 _TERMINAL_STATES = {"success", "failed", "canceled"}
@@ -48,7 +46,7 @@ class CIResult:
 
 
 def trigger_ci(
-    gitlab: GitLabClient,
+    client: Any,
     branch: str,
     variables: dict[str, str] | None = None,
 ) -> int:
@@ -57,8 +55,8 @@ def trigger_ci(
 
     Parameters
     ----------
-    gitlab:
-        Initialised ``GitLabClient``.
+    client:
+        Initialised ``GitHubClient`` or ``GitLabClient``.
     branch:
         The Git branch to run the pipeline on.
     variables:
@@ -69,13 +67,13 @@ def trigger_ci(
     int
         The pipeline ID.
     """
-    pipeline_id = gitlab.trigger_pipeline(branch, variables=variables)
+    pipeline_id = client.trigger_pipeline(branch, variables=variables)
     logger.info("CI pipeline %d triggered on branch %s", pipeline_id, branch)
     return pipeline_id
 
 
 def wait_for_pipeline(
-    gitlab: GitLabClient,
+    client: Any,
     pipeline_id: int,
     poll_interval_seconds: int = 30,
     timeout_minutes: int = 30,
@@ -85,8 +83,8 @@ def wait_for_pipeline(
 
     Parameters
     ----------
-    gitlab:
-        Initialised ``GitLabClient``.
+    client:
+        Initialised ``GitHubClient`` or ``GitLabClient``.
     pipeline_id:
         The pipeline ID to monitor.
     poll_interval_seconds:
@@ -111,7 +109,7 @@ def wait_for_pipeline(
     )
 
     while time.monotonic() < deadline:
-        result: PipelineResult = gitlab.get_pipeline_status(pipeline_id)
+        result = client.get_pipeline_status(pipeline_id)
 
         if result.status in _TERMINAL_STATES:
             ci_result = CIResult(

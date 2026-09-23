@@ -96,3 +96,67 @@ class TestGitHubWaitForApproval:
                         poll_interval_seconds=0,
                         timeout_hours=0.001,
                     )
+
+    def test_seen_comments_prevents_immediate_retrigger(self):
+        """Previously seen comments on GitHub PR must not re-trigger CHANGES_REQUESTED."""
+        mock_gh = MagicMock()
+        mock_gh.get_pr_approvals.return_value = {
+            "approved": False,
+            "approved_by": [],
+            "changes_requested": False,
+        }
+        mock_gh.get_pr_notes.return_value = [
+            {"body": "Fix CSS background", "system": False},
+        ]
+
+        seen = set()
+        result1 = wait_for_approval(
+            client=mock_gh,
+            pr_number=105,
+            poll_interval_seconds=0,
+            timeout_hours=1,
+            return_on_changes_requested=True,
+            seen_comments=seen,
+        )
+        assert result1.outcome == GateOutcome.CHANGES_REQUESTED
+        assert "Fix CSS background" in seen
+
+        mock_gh.get_pr_approvals.side_effect = [
+            {"approved": False, "approved_by": [], "changes_requested": False},
+            {"approved": True, "approved_by": ["lead-dev"], "changes_requested": False},
+        ]
+        with patch("orchestrator.github_gate.time.sleep"):
+            result2 = wait_for_approval(
+                client=mock_gh,
+                pr_number=105,
+                poll_interval_seconds=0,
+                timeout_hours=1,
+                return_on_changes_requested=True,
+                seen_comments=seen,
+            )
+        assert result2.outcome == GateOutcome.APPROVED
+
+    def test_bot_comments_are_ignored(self):
+        """Spec-Driven Dev bot comments must not count as reviewer comments."""
+        mock_gh = MagicMock()
+        mock_gh.get_pr_approvals.side_effect = [
+            {"approved": False, "approved_by": [], "changes_requested": False},
+            {"approved": True, "approved_by": ["lead-dev"], "changes_requested": False},
+        ]
+        mock_gh.get_pr_notes.return_value = [
+            {"body": "🤖 **Spec-Driven Dev Orchestrator**: Revised tests.", "system": False},
+            {"body": "<!-- spec-driven-bot -->\nNotification", "system": False},
+        ]
+
+        with patch("orchestrator.github_gate.time.sleep"):
+            result = wait_for_approval(
+                client=mock_gh,
+                pr_number=106,
+                poll_interval_seconds=0,
+                timeout_hours=1,
+                return_on_changes_requested=True,
+            )
+
+        assert result.outcome == GateOutcome.APPROVED
+        assert result.reviewer_comments == []
+

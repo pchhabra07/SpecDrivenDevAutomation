@@ -124,11 +124,13 @@ class GitHubClient:
 
     def get_file_tree(
         self,
-        ref: str = "main",
+        ref: str | None = None,
         path: str = "",
         recursive: bool = True,
     ) -> list[FileEntry]:
         """Return the full file tree for *ref* under *path*."""
+        if ref is None:
+            ref = self.get_default_branch()
         try:
             # Resolve branch name to commit SHA if needed
             branch = self._repo.get_branch(ref)
@@ -144,8 +146,10 @@ class GitHubClient:
             results.append(FileEntry(path=item.path, type=item.type))
         return results
 
-    def get_file_content(self, file_path: str, ref: str = "main") -> str:
+    def get_file_content(self, file_path: str, ref: str | None = None) -> str:
         """Return the decoded UTF-8 content of a single file."""
+        if ref is None:
+            ref = self.get_default_branch()
         content_file = self._repo.get_contents(file_path, ref=ref)
         if isinstance(content_file, list):
             raise ValueError(f"Path '{file_path}' is a directory, not a file")
@@ -157,8 +161,10 @@ class GitHubClient:
 
     # ── Branch management ───────────────────────────────────────────────
 
-    def create_branch(self, branch_name: str, ref: str = "main") -> None:
+    def create_branch(self, branch_name: str, ref: str | None = None) -> None:
         """Create a new branch from *ref*."""
+        if ref is None:
+            ref = self.get_default_branch()
         base_branch = self._repo.get_branch(ref)
         base_sha = base_branch.commit.sha
         self._repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base_sha)
@@ -412,6 +418,16 @@ class GitHubClient:
     def get_mr_notes(self, pr_number: int) -> list[dict[str, Any]]:
         """Compatibility alias for get_pr_notes."""
         return self.get_pr_notes(pr_number)
+
+    def add_pr_comment(self, pr_number: int, comment: str) -> None:
+        """Add a comment to a Pull Request."""
+        issue = self._repo.get_issue(pr_number)
+        issue.create_comment(comment)
+        logger.info("Comment posted to PR #%d", pr_number)
+
+    def add_mr_comment(self, pr_number: int, comment: str) -> None:
+        """Compatibility alias for add_pr_comment."""
+        self.add_pr_comment(pr_number, comment)
 
     # ── GitHub Actions CI/CD ───────────────────────────────────────────
 

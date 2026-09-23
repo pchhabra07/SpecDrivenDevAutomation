@@ -42,29 +42,14 @@ def wait_for_approval(
     poll_interval_seconds: int = 30,
     timeout_hours: float = 48.0,
     return_on_changes_requested: bool = False,
+    seen_comments: set[str] | None = None,
 ) -> GateResult:
     """
     Poll a GitHub PR's approval state until it is approved or times out.
-
-    Parameters
-    ----------
-    client:
-        Initialised ``GitHubClient``.
-    pr_number:
-        The pull request number to poll.
-    poll_interval_seconds:
-        Seconds between successive API polls.
-    timeout_hours:
-        Maximum hours to wait before raising ``GateTimeoutError``.
-    return_on_changes_requested:
-        If True, return immediately with CHANGES_REQUESTED when reviewer comments
-        or change requests are detected on an unapproved PR.
-
-    Returns
-    -------
-    GateResult
-        Contains outcome, approver usernames, and reviewer comments.
     """
+    if seen_comments is None:
+        seen_comments = set()
+
     deadline = time.monotonic() + (timeout_hours * 3600)
     logger.info("Waiting for approval on PR #%d (timeout=%.1fh)", pr_number, timeout_hours)
 
@@ -81,23 +66,17 @@ def wait_for_approval(
             logger.info("PR #%d APPROVED by %s", pr_number, result.approved_by)
             return result
 
-        if approvals.get("changes_requested") and return_on_changes_requested:
-            comments = _fetch_comments(client, pr_number)
-            logger.info("PR #%d CHANGES_REQUESTED detected", pr_number)
-            return GateResult(
-                outcome=GateOutcome.CHANGES_REQUESTED,
-                approved_by=[],
-                reviewer_comments=comments,
-            )
+        # Check for NEW reviewer comments that signal change requests
+        all_comments = _fetch_comments(client, pr_number)
+        new_comments = [c for c in all_comments if c not in seen_comments]
 
-        # Also inspect comments for change-requests
-        comments = _fetch_comments(client, pr_number)
-        if comments and return_on_changes_requested:
+        if return_on_changes_requested and new_comments:
             logger.info("Returning early on reviewer feedback for PR #%d", pr_number)
+            seen_comments.update(all_comments)
             return GateResult(
                 outcome=GateOutcome.CHANGES_REQUESTED,
                 approved_by=[],
-                reviewer_comments=comments,
+                reviewer_comments=new_comments,
             )
 
         logger.debug("PR #%d not yet approved — polling again in %ds", pr_number, poll_interval_seconds)
@@ -109,6 +88,17 @@ def wait_for_approval(
 
 
 def _fetch_comments(client: Any, pr_number: int) -> list[str]:
-    """Return non-system comment bodies from the PR."""
+    """Return non-system reviewer comment bodies from the PR."""
     notes = client.get_pr_notes(pr_number)
-    return [n["body"] for n in notes if not n.get("system") and n.get("body")]
+    comments: list[str] = []
+    for n in notes:
+        if n.get("system"):
+            continue
+        body = (n.get("body") or "").strip()
+        if not body:
+            continue
+        if "<!-- spec-driven-bot -->" in body or body.startswith("🤖 **Spec-Driven Dev"):
+            continue
+        comments.append(body)
+    return comments
+

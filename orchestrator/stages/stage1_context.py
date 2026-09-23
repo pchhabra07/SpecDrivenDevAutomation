@@ -35,12 +35,18 @@ _TEST_PATTERNS = (
     "*.spec.jsx",
 )
 
-# Glob patterns for JS/TS source files (excluding tests, configs, assets).
+# Glob patterns for source files (excluding tests, configs, assets).
 _SOURCE_EXTENSIONS = (
     "*.ts",
     "*.tsx",
     "*.js",
     "*.jsx",
+    "*.html",
+    "*.htm",
+    "*.css",
+    "*.scss",
+    "*.sass",
+    "*.py",
 )
 
 _IGNORE_DIRS = (

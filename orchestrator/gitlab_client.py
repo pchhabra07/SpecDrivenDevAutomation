@@ -102,6 +102,16 @@ class GitLabClient:
         except gitlab.exceptions.GitlabGetError:
             return False
 
+    def delete_file(self, path: str, branch: str, message: str) -> bool:
+        """Delete a file from *branch* if it exists."""
+        try:
+            self._project.files.delete(file_path=path, branch=branch, commit_message=message)
+            logger.info("Deleted %s from branch %s", path, branch)
+            return True
+        except Exception as exc:
+            logger.debug("Could not delete %s from %s: %s", path, branch, exc)
+            return False
+
     # ── Commits ─────────────────────────────────────────────────────────
 
     def commit_files(
@@ -250,6 +260,12 @@ class GitLabClient:
             for n in notes
             if not n.system  # skip system-generated notes
         ]
+
+    def add_mr_comment(self, mr_iid: int, comment: str) -> None:
+        """Add a comment/note to a Merge Request."""
+        mr = self._project.mergerequests.get(mr_iid)
+        mr.notes.create({"body": comment})
+        logger.info("Comment posted to MR !%d", mr_iid)
 
     # ── CI/CD Pipelines ────────────────────────────────────────────────
 

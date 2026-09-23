@@ -33,16 +33,17 @@ jobs:
 
       - name: Run ESLint
         run: |
-          if [ -d "frontend/toDoList-Frontend" ]; then
-            cd frontend/toDoList-Frontend
+          PKG_DIR=$(dirname $(find . -maxdepth 2 -name "package.json" -not -path "*/node_modules/*" | head -n 1))
+          if [ -n "$PKG_DIR" ] && [ "$PKG_DIR" != "." ]; then
+            cd "$PKG_DIR"
             npm install --legacy-peer-deps || true
             npx eslint . --max-warnings=50 || true
-            cd ../..
+            cd - > /dev/null
           elif [ -f "package.json" ]; then
             npm install --legacy-peer-deps || true
             npx eslint . --max-warnings=50 || true
           else
-            echo "No ESLint configuration found, skipping."
+            echo "No package.json found, skipping ESLint."
           fi
 
   # ── Gate 2: Static Application Security Testing (SAST) ───────────────
@@ -102,19 +103,11 @@ jobs:
           echo "=== Locating Tests in Target Repository ==="
           find . -name "*.test.*" -o -name "*.spec.*" | grep -v node_modules || true
 
-          if [ -d "frontend/toDoList-Frontend" ]; then
-            echo "Running tests in frontend/toDoList-Frontend..."
-            cd frontend/toDoList-Frontend
-            npm install --legacy-peer-deps || true
-            npm install --save-dev vitest jsdom @testing-library/react @testing-library/dom @testing-library/jest-dom @testing-library/user-event @vitejs/plugin-react --legacy-peer-deps || true
-            echo "import '@testing-library/jest-dom';" > vitest.setup.js
-            echo "import { defineConfig } from 'vitest/config';" > vitest.config.js
-            echo "import react from '@vitejs/plugin-react';" >> vitest.config.js
-            echo "export default defineConfig({ plugins: [react()], test: { globals: true, environment: 'jsdom', setupFiles: ['./vitest.setup.js'] } });" >> vitest.config.js
-            npx vitest run
-            cd ../..
-          elif [ -f "package.json" ]; then
-            echo "Running tests in root directory..."
+          PKG_DIR=$(dirname $(find . -maxdepth 2 -name "package.json" -not -path "*/node_modules/*" | head -n 1))
+
+          if [ -n "$PKG_DIR" ] && [ -f "$PKG_DIR/package.json" ]; then
+            echo "Running tests in $PKG_DIR..."
+            [ "$PKG_DIR" != "." ] && cd "$PKG_DIR"
             npm install --legacy-peer-deps || true
             npm install --save-dev vitest jsdom @testing-library/react @testing-library/dom @testing-library/jest-dom @testing-library/user-event @vitejs/plugin-react --legacy-peer-deps || true
             echo "import '@testing-library/jest-dom';" > vitest.setup.js
@@ -122,9 +115,22 @@ jobs:
             echo "import react from '@vitejs/plugin-react';" >> vitest.config.js
             echo "export default defineConfig({ plugins: [react()], test: { globals: true, environment: 'jsdom', setupFiles: ['./vitest.setup.js'] } });" >> vitest.config.js
             npx vitest run || npm test
+            [ "$PKG_DIR" != "." ] && cd - > /dev/null
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
+            echo "Running Python test suite..."
+            python -m pip install --upgrade pytest || true
+            pytest
           else
-            echo "No package.json found."
-            exit 1
+            echo "Running tests in static/lightweight environment..."
+            if find . -name "*.test.*" -o -name "*.spec.*" | grep -v node_modules | grep -q .; then
+              npm init -y
+              npm install --save-dev vitest jsdom @testing-library/dom --legacy-peer-deps || true
+              echo "import { defineConfig } from 'vitest/config';" > vitest.config.js
+              echo "export default defineConfig({ test: { globals: true, environment: 'jsdom' } });" >> vitest.config.js
+              npx vitest run
+            else
+              echo "No tests found to run."
+            fi
           fi
         env:
           CI: true

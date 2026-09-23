@@ -90,7 +90,7 @@ class GitHubIssueClient:
         reporter = issue.user.login if issue.user else None
         status = issue.state or "open"
 
-        acceptance = self._extract_acceptance_criteria(description)
+        acceptance = self._extract_acceptance_criteria(description, summary)
 
         ticket = TicketData(
             ticket_id=str(ticket_id),
@@ -180,29 +180,30 @@ class GitHubIssueClient:
     # ── Helpers ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _extract_acceptance_criteria(body: str) -> str:
+    def _extract_acceptance_criteria(body: str, summary: str = "") -> str:
         """
         Extract Acceptance Criteria from markdown issue body.
         Looks for '## Acceptance Criteria' or checklist items.
+        Falls back to body, or summary if body is empty.
         """
-        if not body:
-            return ""
+        if body:
+            # Pattern 1: Section under ## or ### Acceptance Criteria
+            match = re.search(
+                r"#{1,3}\s+Acceptance\s+Criteria\s*\n(.*?)(?=\n#{1,3}\s|\Z)",
+                body,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if match:
+                criteria = match.group(1).strip()
+                if criteria:
+                    return criteria
 
-        # Pattern 1: Section under ## or ### Acceptance Criteria
-        match = re.search(
-            r"#{1,3}\s+Acceptance\s+Criteria\s*\n(.*?)(?=\n#{1,3}\s|\Z)",
-            body,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if match:
-            criteria = match.group(1).strip()
-            if criteria:
-                return criteria
+            # Pattern 2: Markdown task checklists (- [ ] ...)
+            checklist_items = re.findall(r"^[*-]\s*\[[ xX]\].*$", body, re.MULTILINE)
+            if checklist_items:
+                return "\n".join(checklist_items)
 
-        # Pattern 2: Markdown task checklists (- [ ] ...)
-        checklist_items = re.findall(r"^[*-]\s*\[[ xX]\].*$", body, re.MULTILINE)
-        if checklist_items:
-            return "\n".join(checklist_items)
+            if body.strip():
+                return body.strip()
 
-        # Fallback to full body
-        return body.strip()
+        return summary.strip()

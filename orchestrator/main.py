@@ -137,18 +137,33 @@ def run_pipeline(
     # ── Checkpoint: resume or create ────────────────────────────────────
     checkpoint = Checkpoint.load(ticket_id, settings.checkpoint_dir)
     if checkpoint:
-        logger.info(
-            "Resuming from checkpoint (stage=%d, iter=%d)",
-            checkpoint.current_stage,
-            checkpoint.iteration_count,
-        )
         if checkpoint.repo_id and str(checkpoint.repo_id) != str(gitlab.project_id):
-            logger.info("Resuming ticket in mapped repository ID %s", checkpoint.repo_id)
-            gitlab.switch_project(checkpoint.repo_id)
-        if checkpoint.conversation_history:
-            llm.set_history(checkpoint.conversation_history)
+            if repo_resolver and repo_resolver.resolve(ticket_id) == checkpoint.repo_id:
+                logger.info("Resuming ticket in mapped repository ID %s", checkpoint.repo_id)
+                gitlab.switch_project(checkpoint.repo_id)
+            else:
+                logger.warning(
+                    "Checkpoint %s belongs to repo '%s', but current active repo is '%s'. Ignoring stale checkpoint and starting fresh.",
+                    ticket_id,
+                    checkpoint.repo_id,
+                    gitlab.project_id,
+                )
+                checkpoint = Checkpoint(ticket_id=ticket_id)
+                checkpoint.repo_id = gitlab.project_id
+
+        if checkpoint.current_stage > 1:
+            logger.info(
+                "Resuming from checkpoint (stage=%d, iter=%d)",
+                checkpoint.current_stage,
+                checkpoint.iteration_count,
+            )
+            if checkpoint.conversation_history:
+                llm.set_history(checkpoint.conversation_history)
+        else:
+            logger.info("Starting fresh from Stage 1.")
     else:
         checkpoint = Checkpoint(ticket_id=ticket_id)
+        checkpoint.repo_id = gitlab.project_id
         logger.info("No checkpoint found — starting fresh.")
 
     audit.log(

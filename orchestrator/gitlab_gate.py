@@ -42,10 +42,14 @@ def wait_for_approval(
     poll_interval_seconds: int = 30,
     timeout_hours: float = 48.0,
     return_on_changes_requested: bool = False,
+    seen_comments: set[str] | None = None,
 ) -> GateResult:
     """
     Poll a GitLab MR or GitHub PR approval state until it is approved or times out.
     """
+    if seen_comments is None:
+        seen_comments = set()
+
     deadline = time.monotonic() + (timeout_hours * 3600)
     logger.info("Waiting for approval on MR/PR #%d (timeout=%.1fh)", mr_iid, timeout_hours)
 
@@ -67,30 +71,22 @@ def wait_for_approval(
             logger.info("MR/PR #%d APPROVED by %s", mr_iid, result.approved_by)
             return result
 
-        if approvals.get("changes_requested") and return_on_changes_requested:
-            comments = _fetch_comments(gitlab, mr_iid)
-            logger.info("MR/PR #%d CHANGES_REQUESTED detected", mr_iid)
+        # Check for NEW reviewer comments that signal change requests
+        all_comments = _fetch_comments(gitlab, mr_iid)
+        new_comments = [c for c in all_comments if c not in seen_comments]
+
+        if return_on_changes_requested and new_comments:
+            logger.info(
+                "MR/PR #%d has %d new reviewer comment(s). Returning early on feedback.",
+                mr_iid,
+                len(new_comments),
+            )
+            seen_comments.update(all_comments)
             return GateResult(
                 outcome=GateOutcome.CHANGES_REQUESTED,
                 approved_by=[],
-                reviewer_comments=comments,
+                reviewer_comments=new_comments,
             )
-
-        # Check for reviewer comments that might signal change requests.
-        comments = _fetch_comments(gitlab, mr_iid)
-        if comments:
-            logger.info(
-                "MR/PR #%d has %d reviewer comment(s) but is not yet approved.",
-                mr_iid,
-                len(comments),
-            )
-            if return_on_changes_requested:
-                logger.info("Returning early on reviewer feedback for MR/PR #%d", mr_iid)
-                return GateResult(
-                    outcome=GateOutcome.CHANGES_REQUESTED,
-                    approved_by=[],
-                    reviewer_comments=comments,
-                )
 
         logger.debug("MR/PR #%d not yet approved — polling again in %ds", mr_iid, poll_interval_seconds)
         time.sleep(poll_interval_seconds)
@@ -101,11 +97,22 @@ def wait_for_approval(
 
 
 def _fetch_comments(gitlab: Any, mr_iid: int) -> list[str]:
-    """Return non-system comment bodies from the MR or PR."""
+    """Return non-system reviewer comment bodies from the MR or PR."""
     if hasattr(gitlab, "get_mr_notes"):
         notes = gitlab.get_mr_notes(mr_iid)
     elif hasattr(gitlab, "get_pr_notes"):
         notes = gitlab.get_pr_notes(mr_iid)
     else:
         notes = []
-    return [n["body"] for n in notes if not n.get("system") and n.get("body")]
+
+    comments: list[str] = []
+    for n in notes:
+        if n.get("system"):
+            continue
+        body = (n.get("body") or "").strip()
+        if not body:
+            continue
+        if "<!-- spec-driven-bot -->" in body or body.startswith("🤖 **Spec-Driven Dev"):
+            continue
+        comments.append(body)
+    return comments

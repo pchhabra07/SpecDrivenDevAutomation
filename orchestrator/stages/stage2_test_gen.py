@@ -115,6 +115,7 @@ def run(
     # ── 5. Wait for human approval (with revision loop) ────────────────
     logger.info("Waiting for Gate 1 human approval…")
     approved_tests = generated_tests
+    seen_comments: set[str] = set()
     for cycle in range(1, _MAX_REVISION_CYCLES + 1):
         logger.info("Gate 1 approval cycle %d/%d", cycle, _MAX_REVISION_CYCLES)
 
@@ -124,6 +125,7 @@ def run(
             poll_interval_seconds=gate_poll_interval,
             timeout_hours=gate_timeout_hours,
             return_on_changes_requested=True,
+            seen_comments=seen_comments,
         )
 
         if gate_result.outcome == GateOutcome.APPROVED:
@@ -146,9 +148,22 @@ def run(
                 event_type="gate1_changes_requested",
                 payload={"comments": gate_result.reviewer_comments, "cycle": cycle},
             )
-            approved_tests = _revise_tests(
+            revised_tests = _revise_tests(
                 llm, context, approved_tests, gate_result.reviewer_comments,
             )
+
+            # Remove obsolete files from git branch if they were dropped during revision
+            removed_files = set(approved_tests.keys()) - set(revised_tests.keys())
+            for rm_path in removed_files:
+                if hasattr(gitlab, "delete_file"):
+                    gitlab.delete_file(
+                        path=rm_path,
+                        branch=tests_branch,
+                        message=f"[spec-driven] Remove obsolete test {rm_path} per reviewer feedback",
+                    )
+
+            approved_tests = revised_tests
+
             gitlab.commit_files(
                 branch=tests_branch,
                 files=approved_tests,
@@ -157,6 +172,26 @@ def run(
                     f"(revision {cycle})"
                 ),
             )
+
+            # Post a comment back on the PR to notify the human reviewer of the update
+            file_bullets = "\n".join(f"- `{f}`" for f in approved_tests)
+            removed_bullets = (
+                f"\n\n**Removed Files:**\n" + "\n".join(f"- `{f}`" for f in removed_files)
+                if removed_files
+                else ""
+            )
+            bot_msg = (
+                f"<!-- spec-driven-bot -->\n"
+                f"🤖 **Spec-Driven Dev Orchestrator** (Revision {cycle}/{_MAX_REVISION_CYCLES})\n\n"
+                f"I have updated the test suite based on your feedback.\n\n"
+                f"**Active Test Files:**\n{file_bullets}{removed_bullets}\n\n"
+                f"Please review the updated tests. If everything looks good, approve this PR to proceed."
+            )
+            if hasattr(gitlab, "add_mr_comment"):
+                gitlab.add_mr_comment(checkpoint.gate1_mr_iid, bot_msg)
+            elif hasattr(gitlab, "add_pr_comment"):
+                gitlab.add_pr_comment(checkpoint.gate1_mr_iid, bot_msg)
+            seen_comments.add(bot_msg)
     else:
         raise RuntimeError(
             f"Gate 1 for {ticket.ticket_id} not approved after "
@@ -178,12 +213,42 @@ def run(
     return approved_tests
 
 
+# ── Project stack detection helper ─────────────────────────────────────
+
+
+def _detect_project_stack(context: TicketContext) -> str:
+    """Identify the primary technology stack of the target repository."""
+    paths = [p.lower() for p in context.all_file_paths]
+
+    has_pkg_json = any(p == "package.json" or p.endswith("/package.json") for p in paths)
+    if has_pkg_json:
+        has_react = any(
+            p.endswith((".tsx", ".jsx")) or "react" in p
+            for p in paths
+        )
+        return "react" if has_react else "node"
+
+    has_html_css = any(p.endswith((".html", ".htm", ".css")) for p in paths)
+    if has_html_css and not has_pkg_json:
+        return "static_web"
+
+    has_python = any(
+        p.endswith(".py") or p in ("pyproject.toml", "requirements.txt", "setup.py")
+        for p in paths
+    )
+    if has_python:
+        return "python"
+
+    return "generic"
+
+
 # ── LLM prompt helpers ──────────────────────────────────────────────────
 
 
 def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
-    """Prompt the LLM to generate Jest test cases from the ticket spec."""
+    """Prompt the LLM to generate test cases from the ticket spec."""
     ticket = context.ticket
+    stack = _detect_project_stack(context)
 
     # Build a summary of existing tests for context.
     existing_tests_summary = ""
@@ -191,7 +256,7 @@ def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
         existing_tests_summary = (
             "## Existing Test Files\n"
             + "\n".join(
-                f"### `{path}`\n```typescript\n{content}\n```"
+                f"### `{path}`\n```\n{content}\n```"
                 for path, content in list(context.test_files.items())[:10]
             )
         )
@@ -202,15 +267,51 @@ def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
         source_summary = (
             "## Relevant Source Files\n"
             + "\n".join(
-                f"### `{path}`\n```typescript\n{content}\n```"
+                f"### `{path}`\n```\n{content}\n```"
                 for path, content in list(context.source_files.items())[:15]
             )
         )
 
+    # Stack-specific instructions
+    if stack == "static_web":
+        stack_instructions = (
+            "### Technology Stack: Static Web (HTML/CSS/Vanilla JS)\n"
+            "- This repository is a static frontend project (HTML, CSS, assets). There is NO backend, NO React, and NO package.json.\n"
+            f"- Available source files in repo: {', '.join(f'`{k}`' for k in context.source_files.keys())}.\n"
+            "- Generate a simple, focused test file (e.g. `tests/test_background.js` or `tests/test_background.py`) that directly inspects the relevant file (e.g. `style.css` or `index.html`) to assert that the ticket's acceptance criteria are met.\n"
+            "- If using JavaScript, write clean Jest/Vitest test code reading the files via `fs.readFileSync(path.resolve(__dirname, '../style.css'), 'utf8')`.\n"
+            "- STRICT PROHIBITIONS:\n"
+            "  * DO NOT generate tests for `package.json`, `package-lock.json`, or node_modules.\n"
+            "  * DO NOT generate tests verifying whether Node.js or npm is installed.\n"
+            "  * DO NOT import React, ReactDOM, or `@testing-library/react`.\n"
+            "  * DO NOT invent non-existent files or components like `App.tsx` or `styles.css` (use the exact file names present in the repo, such as `style.css`).\n"
+        )
+    elif stack == "react":
+        stack_instructions = (
+            "### Technology Stack: React\n"
+            "- Use Jest / Vitest + React Testing Library.\n"
+            "- Follow the naming convention: `<module>.test.tsx` or `<module>.test.ts`.\n"
+            "- Test component behavior and UI elements specified in the acceptance criteria.\n"
+            "- DO NOT generate irrelevant tests for package managers, lockfiles, or node installation.\n"
+        )
+    elif stack == "python":
+        stack_instructions = (
+            "### Technology Stack: Python\n"
+            "- Use `pytest` for test cases.\n"
+            "- Follow the naming convention: `tests/test_<feature>.py`.\n"
+            "- Directly test functions, classes, or endpoints specified in the acceptance criteria.\n"
+        )
+    else:
+        stack_instructions = (
+            "### Technology Stack: Standard / Node\n"
+            "- Use Jest / Vitest or the repo's existing test framework.\n"
+            "- Follow the naming convention: `<module>.test.ts` or `<module>.test.js`.\n"
+            "- DO NOT generate irrelevant tests for package managers or environment setup.\n"
+        )
+
     prompt = (
-        "You are a senior test engineer.  Your task is to generate comprehensive "
-        "test cases based **solely** on the ticket's specification and acceptance "
-        "criteria below — NOT from the existing code.\n\n"
+        "You are a senior test engineer. Your task is to generate clean, highly relevant "
+        "test cases based **solely** on the ticket's specification and acceptance criteria below.\n\n"
         "## Ticket\n"
         f"**ID:** {ticket.ticket_id}\n"
         f"**Summary:** {ticket.summary}\n"
@@ -218,19 +319,17 @@ def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
         f"**Acceptance Criteria:**\n{ticket.acceptance_criteria}\n\n"
         f"{source_summary}\n\n"
         f"{existing_tests_summary}\n\n"
-        "## Instructions\n"
-        "1. Generate unit tests, and integration/regression tests where applicable.\n"
-        "2. Each test must directly trace back to an acceptance criterion.\n"
-        "3. Use Jest + React Testing Library where React components are involved.\n"
-        "4. Follow the naming convention: `<module>.test.ts` or `<module>.test.tsx`.\n"
-        "5. Do NOT modify existing test files — only create new test files or "
-        "   clearly mark additions to existing ones.\n"
-        "6. Include clear `describe` / `it` blocks with descriptive names.\n\n"
+        "## Stack & Testing Guidelines\n"
+        f"{stack_instructions}\n"
+        "## Core Principles\n"
+        "1. Every single test MUST directly verify an acceptance criterion from the ticket.\n"
+        "2. Keep test cases minimal, focused, and free of useless boilerplate.\n"
+        "3. Do NOT test things unrelated to the ticket (e.g. do not test build configurations, lockfiles, or unrelated files).\n"
+        "4. Follow the existing project structure and reference actual repository file paths.\n\n"
         "## Output Format\n"
-        "Return your answer as one or more fenced code blocks, each preceded by "
-        "a single-line file path comment like:\n"
+        "Return your answer as one or more fenced code blocks, each preceded by a single-line file path comment like:\n"
         "```\n"
-        "// FILE: src/__tests__/myModule.test.ts\n"
+        "// FILE: tests/background.test.js\n"
         "```\n"
         "followed by the complete file content.\n"
         "Do not include any explanation outside of code blocks."
@@ -250,29 +349,33 @@ def _revise_tests(
     """Re-prompt the LLM with reviewer feedback to revise tests."""
     comments_text = "\n".join(f"- {c}" for c in reviewer_comments)
     current_tests_text = "\n".join(
-        f"### `{path}`\n```typescript\n{content}\n```"
+        f"### `{path}`\n```\n{content}\n```"
         for path, content in current_tests.items()
     )
 
     prompt = (
-        "A human reviewer has requested changes to the test cases you generated "
-        "earlier.  Here are their comments:\n\n"
-        f"{comments_text}\n\n"
-        "Here are the current test files:\n\n"
-        f"{current_tests_text}\n\n"
-        "Please revise the tests to address the reviewer's feedback. "
-        "Return the complete updated files in the same format as before "
-        "(fenced code blocks with `// FILE:` path comments)."
+        "A human reviewer has requested changes to the test cases you generated earlier.\n\n"
+        f"## Reviewer Feedback\n{comments_text}\n\n"
+        f"## Current Test Files\n{current_tests_text}\n\n"
+        "## Instructions\n"
+        "1. Address ALL points raised in the reviewer's feedback.\n"
+        "2. If the reviewer requested removing any tests or test files, DO NOT include them.\n"
+        "3. Return ONLY the complete, final set of valid test files that should exist in the repository.\n"
+        "4. Do NOT generate unnecessary tests for package-lock.json, build tools, or node installation unless explicitly requested.\n"
+        "5. Output format: fenced code blocks with `// FILE: path` comments.\n"
+        "6. Do not include any explanation outside of code blocks."
     )
 
     response = llm.chat(prompt)
     content = response.get("content", "")
     revised = _parse_test_files(content)
 
-    # Merge: updated files override, untouched files carry over.
-    merged = dict(current_tests)
-    merged.update(revised)
-    return merged
+    if revised:
+        return revised
+
+    logger.warning("LLM returned no parsed test files on revision; keeping existing tests.")
+    return current_tests
+
 
 
 def _parse_test_files(llm_output: str) -> dict[str, str]:

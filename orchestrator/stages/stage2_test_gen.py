@@ -1,10 +1,14 @@
 """
-Stage 2 — Generate Test Cases (Pre-Development).
+Stage 2 — Generate Test Cases (Pre-Development) & Repository CI Workflow.
 
-Prompts the LLM to generate Jest test cases driven by the ticket's
+Prompts the LLM to generate test cases driven by the ticket's
 specification and acceptance criteria — *before* any code changes are
-made.  The proposed tests are committed to a dedicated branch and
-presented as a PR/MR for human review (Gate 1).
+made.  Also ensures the repository has a repo-specific CI workflow
+(generating one via LLM if none exists, or adapting an existing workflow
+if needed for the new tests).
+
+The proposed tests (and CI workflow if new/updated) are committed to a
+dedicated branch and presented as a PR/MR for human review (Gate 1).
 
 Once the reviewer approves, the test files are "locked" by recording
 their SHA-256 hashes in the checkpoint.  From this point forward the
@@ -24,6 +28,10 @@ from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
+from orchestrator.ci_generator import (
+    find_existing_ci_workflow,
+    generate_fallback_ci,
+)
 from orchestrator.gitlab_gate import GateOutcome, wait_for_approval
 from orchestrator.llm_client import LLMClient
 from orchestrator.stages.stage1_context import TicketContext
@@ -45,7 +53,7 @@ def run(
     gate_timeout_hours: float = 48.0,
 ) -> dict[str, str]:
     """
-    Execute Stage 2: generate tests → open MR → await approval → lock.
+    Execute Stage 2: generate tests & workflow → open PR → await approval → lock.
 
     Returns
     -------
@@ -55,9 +63,30 @@ def run(
     audit.log(stage=2, event_type="stage2_start")
     ticket = context.ticket
 
-    # ── 1. Generate test cases via LLM ──────────────────────────────────
-    logger.info("Calling LLM to generate test cases…")
-    generated_tests = _generate_tests(llm, context)
+    # ── 1. Create the tests-only branch ─────────────────────────────────
+    logger.info("Creating test branch…")
+    tests_branch = f"automation/{ticket.ticket_id}/tests"
+    if not gitlab.branch_exists(tests_branch):
+        gitlab.create_branch(tests_branch, ref=context.default_branch)
+    checkpoint.tests_branch = tests_branch
+
+    # Inspect for existing CI workflow on default branch / repository
+    existing_ci_path, existing_ci_content = find_existing_ci_workflow(
+        gitlab=gitlab,
+        branch=context.default_branch,
+        all_file_paths=context.all_file_paths,
+    )
+
+    # ── 2. Generate test cases & repo-specific CI via LLM ───────────────
+    logger.info("Calling LLM to generate test cases and evaluate CI workflow…")
+    repo_id = getattr(gitlab, "project_id", None) or getattr(gitlab, "repo_name", "target-repo")
+    generated_tests, ci_workflow_update = _generate_tests(
+        llm=llm,
+        context=context,
+        existing_ci_path=existing_ci_path,
+        existing_ci_content=existing_ci_content,
+        repo_id=str(repo_id),
+    )
     logger.info("LLM generated %d test file(s)", len(generated_tests))
 
     if not generated_tests:
@@ -66,29 +95,36 @@ def run(
             f"Stage 2 failed: LLM did not generate any test files matching the expected format for ticket {ticket.ticket_id}."
         )
 
-    # ── 2. Create the tests-only branch ─────────────────────────────────
-    logger.info("Creating test branch…")
-    tests_branch = f"automation/{ticket.ticket_id}/tests"
-    if not gitlab.branch_exists(tests_branch):
-        gitlab.create_branch(tests_branch, ref=context.default_branch)
-    checkpoint.tests_branch = tests_branch
+    # Determine final CI workflow path
+    ci_created_or_updated = False
+    if ci_workflow_update:
+        ci_workflow_path, ci_workflow_content = ci_workflow_update
+        ci_created_or_updated = True
+    elif existing_ci_path:
+        ci_workflow_path = existing_ci_path
+        ci_workflow_content = None
+    else:
+        # Fallback if LLM generated neither tests nor fallback workflow
+        stack = _detect_project_stack(context)
+        ci_workflow_path, ci_workflow_content = generate_fallback_ci(str(repo_id), stack=stack)
+        ci_created_or_updated = True
 
-    # Ensure CI workflow exists for target repository
-    from orchestrator.ci_generator import ensure_target_ci_workflow
+    checkpoint.ci_workflow_path = ci_workflow_path
 
-    repo_id = getattr(gitlab, "project_id", None) or getattr(gitlab, "repo_name", "target-repo")
-    ci_workflow_path, ci_created = ensure_target_ci_workflow(
-        gitlab=gitlab,
-        branch=tests_branch,
-        repo_identifier=repo_id,
-        all_file_paths=context.all_file_paths,
+    # ── 3. Commit test files & CI workflow ──────────────────────────────
+    files_to_commit = dict(generated_tests)
+    if ci_created_or_updated and ci_workflow_content:
+        files_to_commit[ci_workflow_path] = ci_workflow_content
+
+    logger.info(
+        "Committing %d file(s) (tests%s) to branch %s",
+        len(files_to_commit),
+        " + CI workflow" if (ci_created_or_updated and ci_workflow_content) else "",
+        tests_branch,
     )
-
-    # ── 3. Commit test files ────────────────────────────────────────────
-    logger.info("Committing generated tests to branch %s", tests_branch)
     gitlab.commit_files(
         branch=tests_branch,
-        files=generated_tests,
+        files=files_to_commit,
         commit_message=f"[spec-driven] Generate tests for {ticket.ticket_id}",
     )
 
@@ -102,7 +138,7 @@ def run(
             description=_build_mr_description(
                 ticket,
                 generated_tests,
-                ci_workflow_path=ci_workflow_path if ci_created else None,
+                ci_workflow_path=ci_workflow_path if ci_created_or_updated else None,
             ),
             draft=True,
         )
@@ -116,6 +152,19 @@ def run(
     logger.info("Waiting for Gate 1 human approval…")
     approved_tests = generated_tests
     seen_comments: set[str] = set()
+
+    # Pre-seed seen_comments with any comments already present on the PR
+    if hasattr(gitlab, "get_pr_notes"):
+        for n in gitlab.get_pr_notes(checkpoint.gate1_mr_iid):
+            b = (n.get("body") or "").strip()
+            if b:
+                seen_comments.add(b)
+    elif hasattr(gitlab, "get_mr_notes"):
+        for n in gitlab.get_mr_notes(checkpoint.gate1_mr_iid):
+            b = (n.get("body") or "").strip()
+            if b:
+                seen_comments.add(b)
+
     for cycle in range(1, _MAX_REVISION_CYCLES + 1):
         logger.info("Gate 1 approval cycle %d/%d", cycle, _MAX_REVISION_CYCLES)
 
@@ -148,7 +197,7 @@ def run(
                 event_type="gate1_changes_requested",
                 payload={"comments": gate_result.reviewer_comments, "cycle": cycle},
             )
-            revised_tests = _revise_tests(
+            revised_tests, revised_ci = _revise_tests(
                 llm, context, approved_tests, gate_result.reviewer_comments,
             )
 
@@ -163,10 +212,13 @@ def run(
                     )
 
             approved_tests = revised_tests
+            revision_commit_files = dict(approved_tests)
+            if revised_ci:
+                revision_commit_files[revised_ci[0]] = revised_ci[1]
 
             gitlab.commit_files(
                 branch=tests_branch,
-                files=approved_tests,
+                files=revision_commit_files,
                 commit_message=(
                     f"[spec-driven] Revise tests for {ticket.ticket_id} "
                     f"(revision {cycle})"
@@ -220,6 +272,15 @@ def _detect_project_stack(context: TicketContext) -> str:
     """Identify the primary technology stack of the target repository."""
     paths = [p.lower() for p in context.all_file_paths]
 
+    # 1. Python check
+    has_python = any(
+        p.endswith(".py") or p in ("pyproject.toml", "requirements.txt", "setup.py", "pipfile")
+        for p in paths
+    )
+    if has_python:
+        return "python"
+
+    # 2. Node / React check
     has_pkg_json = any(p == "package.json" or p.endswith("/package.json") for p in paths)
     if has_pkg_json:
         has_react = any(
@@ -228,16 +289,25 @@ def _detect_project_stack(context: TicketContext) -> str:
         )
         return "react" if has_react else "node"
 
-    has_html_css = any(p.endswith((".html", ".htm", ".css")) for p in paths)
-    if has_html_css and not has_pkg_json:
-        return "static_web"
+    # 3. Java check
+    has_java = any(p in ("pom.xml", "build.gradle", "gradlew") or p.endswith(".java") for p in paths)
+    if has_java:
+        return "java"
 
-    has_python = any(
-        p.endswith(".py") or p in ("pyproject.toml", "requirements.txt", "setup.py")
-        for p in paths
-    )
-    if has_python:
-        return "python"
+    # 4. Go check
+    has_go = any(p in ("go.mod", "go.sum") or p.endswith(".go") for p in paths)
+    if has_go:
+        return "go"
+
+    # 5. Rust check
+    has_rust = any(p == "cargo.toml" or p.endswith(".rs") for p in paths)
+    if has_rust:
+        return "rust"
+
+    # 6. Static Web check (only if no package manager or backend was found)
+    has_html_css = any(p.endswith((".html", ".htm", ".css")) for p in paths)
+    if has_html_css:
+        return "static_web"
 
     return "generic"
 
@@ -245,8 +315,14 @@ def _detect_project_stack(context: TicketContext) -> str:
 # ── LLM prompt helpers ──────────────────────────────────────────────────
 
 
-def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
-    """Prompt the LLM to generate test cases from the ticket spec."""
+def _generate_tests(
+    llm: LLMClient,
+    context: TicketContext,
+    existing_ci_path: str | None = None,
+    existing_ci_content: str | None = None,
+    repo_id: str = "target-repo",
+) -> tuple[dict[str, str], tuple[str, str] | None]:
+    """Prompt the LLM to generate test cases and appropriate CI workflow from the ticket spec."""
     ticket = context.ticket
     stack = _detect_project_stack(context)
 
@@ -273,44 +349,103 @@ def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
         )
 
     # Stack-specific instructions
-    if stack == "static_web":
+    if stack == "python":
         stack_instructions = (
-            "### Technology Stack: Static Web (HTML/CSS/Vanilla JS)\n"
-            "- This repository is a static frontend project (HTML, CSS, assets). There is NO backend, NO React, and NO package.json.\n"
-            f"- Available source files in repo: {', '.join(f'`{k}`' for k in context.source_files.keys())}.\n"
-            "- Generate a simple, focused test file (e.g. `tests/test_background.js` or `tests/test_background.py`) that directly inspects the relevant file (e.g. `style.css` or `index.html`) to assert that the ticket's acceptance criteria are met.\n"
-            "- If using JavaScript, write clean Jest/Vitest test code reading the files via `fs.readFileSync(path.resolve(__dirname, '../style.css'), 'utf8')`.\n"
-            "- STRICT PROHIBITIONS:\n"
-            "  * DO NOT generate tests for `package.json`, `package-lock.json`, or node_modules.\n"
-            "  * DO NOT generate tests verifying whether Node.js or npm is installed.\n"
-            "  * DO NOT import React, ReactDOM, or `@testing-library/react`.\n"
-            "  * DO NOT invent non-existent files or components like `App.tsx` or `styles.css` (use the exact file names present in the repo, such as `style.css`).\n"
+            "### Technology Stack: Python\n"
+            "- Use `pytest` for test cases.\n"
+            "- Follow naming convention: `tests/test_<feature>.py`.\n"
+            "- Directly test functions, classes, or endpoints specified in the acceptance criteria.\n"
+            "- DO NOT import JavaScript, Jest, React, or npm modules.\n"
         )
     elif stack == "react":
         stack_instructions = (
             "### Technology Stack: React\n"
             "- Use Jest / Vitest + React Testing Library.\n"
-            "- Follow the naming convention: `<module>.test.tsx` or `<module>.test.ts`.\n"
+            "- Follow naming convention: `<module>.test.tsx` or `<module>.test.ts`.\n"
             "- Test component behavior and UI elements specified in the acceptance criteria.\n"
-            "- DO NOT generate irrelevant tests for package managers, lockfiles, or node installation.\n"
+            "- DO NOT generate irrelevant tests for package managers or environment setup.\n"
         )
-    elif stack == "python":
+    elif stack == "node":
         stack_instructions = (
-            "### Technology Stack: Python\n"
-            "- Use `pytest` for test cases.\n"
-            "- Follow the naming convention: `tests/test_<feature>.py`.\n"
-            "- Directly test functions, classes, or endpoints specified in the acceptance criteria.\n"
+            "### Technology Stack: Node.js / JavaScript\n"
+            "- Use Jest / Vitest or the repo's existing test framework.\n"
+            "- Follow naming convention: `<module>.test.ts` or `<module>.test.js`.\n"
+            "- DO NOT generate irrelevant tests for package managers or environment setup.\n"
+        )
+    elif stack == "java":
+        stack_instructions = (
+            "### Technology Stack: Java\n"
+            "- Use JUnit 5 for test cases.\n"
+            "- Follow standard Maven/Gradle naming: `src/test/java/.../*Test.java`.\n"
+        )
+    elif stack == "go":
+        stack_instructions = (
+            "### Technology Stack: Go\n"
+            "- Use standard Go `testing` package.\n"
+            "- Follow naming convention: `<package>_test.go`.\n"
+        )
+    elif stack == "rust":
+        stack_instructions = (
+            "### Technology Stack: Rust\n"
+            "- Use standard Rust test modules (`#[cfg(test)]`) or `tests/<feature>_test.rs`.\n"
+        )
+    elif stack == "static_web":
+        stack_instructions = (
+            "### Technology Stack: Static Web (HTML/CSS/Vanilla JS)\n"
+            "- This repository is a static frontend project (HTML, CSS, assets). There is NO backend and NO package.json.\n"
+            f"- Available source files in repo: {', '.join(f'`{k}`' for k in context.source_files.keys())}.\n"
+            "- Generate a simple, focused test file (e.g. `tests/test_ui.py` with BeautifulSoup or `tests/test_ui.js` with fs) that inspects DOM/CSS to assert that acceptance criteria are met.\n"
+            "- STRICT PROHIBITIONS:\n"
+            "  * DO NOT generate tests for `package.json`, `package-lock.json`, or node_modules.\n"
+            "  * DO NOT import React, ReactDOM, or `@testing-library/react`.\n"
+            "  * DO NOT invent non-existent files or components (use the exact file names present in the repo).\n"
         )
     else:
         stack_instructions = (
-            "### Technology Stack: Standard / Node\n"
-            "- Use Jest / Vitest or the repo's existing test framework.\n"
-            "- Follow the naming convention: `<module>.test.ts` or `<module>.test.js`.\n"
-            "- DO NOT generate irrelevant tests for package managers or environment setup.\n"
+            "### Technology Stack: Multi-Language / Generic\n"
+            "- Inspect the existing repository files and test frameworks.\n"
+            "- Write tests matching the repository's native conventions.\n"
+        )
+
+    # CI Workflow instructions
+    if existing_ci_path and existing_ci_content:
+        ci_instructions = (
+            f"## Existing CI/CD Workflow (`{existing_ci_path}`)\n"
+            f"```yaml\n{existing_ci_content}\n```\n\n"
+            f"Evaluate if this workflow needs updates to run the new test cases (e.g. adding test execution steps, env variables, or dependencies).\n"
+            f"- If updates ARE needed: Return the complete, updated workflow file: `// FILE: {existing_ci_path}`.\n"
+            f"- If NO updates are needed: Do NOT output `{existing_ci_path}`. Keep the existing workflow as is.\n"
+        )
+    else:
+        ci_instructions = (
+            "## CI/CD Workflow Generation Required\n"
+            "No existing CI/CD workflow was found in `.github/workflows/`.\n"
+            "You MUST generate a complete, working GitHub Actions workflow file tailored specifically to this repository (e.g. `// FILE: .github/workflows/ci.yml`).\n"
+            "Requirements for the workflow:\n"
+            "1. `runs-on: ubuntu-latest`\n"
+            "2. Triggers:\n"
+            "   ```yaml\n"
+            "   on:\n"
+            "     push:\n"
+            "       branches: ['automation/**']\n"
+            "     workflow_dispatch:\n"
+            "       inputs:\n"
+            "         test_only:\n"
+            "           description: 'Run test job only'\n"
+            "           required: false\n"
+            "           default: 'false'\n"
+            "   ```\n"
+            "3. Concurrency control:\n"
+            "   ```yaml\n"
+            "   concurrency:\n"
+            "     group: ${{ github.workflow }}-${{ github.ref }}\n"
+            "     cancel-in-progress: true\n"
+            "   ```\n"
+            "4. Steps: checkout (`actions/checkout@v4`), setup appropriate runtime matching the repository's stack, install dependencies, and run tests.\n"
         )
 
     prompt = (
-        "You are a senior test engineer. Your task is to generate clean, highly relevant "
+        "You are a senior test and automation engineer. Your task is to generate clean, highly relevant "
         "test cases based **solely** on the ticket's specification and acceptance criteria below.\n\n"
         "## Ticket\n"
         f"**ID:** {ticket.ticket_id}\n"
@@ -320,16 +455,17 @@ def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
         f"{source_summary}\n\n"
         f"{existing_tests_summary}\n\n"
         "## Stack & Testing Guidelines\n"
-        f"{stack_instructions}\n"
+        f"{stack_instructions}\n\n"
+        f"{ci_instructions}\n"
         "## Core Principles\n"
         "1. Every single test MUST directly verify an acceptance criterion from the ticket.\n"
         "2. Keep test cases minimal, focused, and free of useless boilerplate.\n"
-        "3. Do NOT test things unrelated to the ticket (e.g. do not test build configurations, lockfiles, or unrelated files).\n"
+        "3. Do NOT test things unrelated to the ticket (e.g. do not test build configurations or lockfiles).\n"
         "4. Follow the existing project structure and reference actual repository file paths.\n\n"
         "## Output Format\n"
         "Return your answer as one or more fenced code blocks, each preceded by a single-line file path comment like:\n"
         "```\n"
-        "// FILE: tests/background.test.js\n"
+        "// FILE: tests/my_test.py\n"
         "```\n"
         "followed by the complete file content.\n"
         "Do not include any explanation outside of code blocks."
@@ -337,7 +473,19 @@ def _generate_tests(llm: LLMClient, context: TicketContext) -> dict[str, str]:
 
     response = llm.chat(prompt)
     content = response.get("content", "")
-    return _parse_test_files(content)
+    all_files = _parse_test_files(content)
+
+    test_files: dict[str, str] = {}
+    ci_workflow: tuple[str, str] | None = None
+
+    for path, file_content in all_files.items():
+        norm = path.replace("\\", "/")
+        if norm.startswith(".github/workflows/") or norm == ".gitlab-ci.yml":
+            ci_workflow = (norm, file_content)
+        else:
+            test_files[norm] = file_content
+
+    return test_files, ci_workflow
 
 
 def _revise_tests(
@@ -345,7 +493,7 @@ def _revise_tests(
     context: TicketContext,
     current_tests: dict[str, str],
     reviewer_comments: list[str],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], tuple[str, str] | None]:
     """Re-prompt the LLM with reviewer feedback to revise tests."""
     comments_text = "\n".join(f"- {c}" for c in reviewer_comments)
     current_tests_text = "\n".join(
@@ -361,7 +509,7 @@ def _revise_tests(
         "1. Address ALL points raised in the reviewer's feedback.\n"
         "2. If the reviewer requested removing any tests or test files, DO NOT include them.\n"
         "3. Return ONLY the complete, final set of valid test files that should exist in the repository.\n"
-        "4. Do NOT generate unnecessary tests for package-lock.json, build tools, or node installation unless explicitly requested.\n"
+        "4. Do NOT generate unnecessary tests for package-lock.json or build tools unless explicitly requested.\n"
         "5. Output format: fenced code blocks with `// FILE: path` comments.\n"
         "6. Do not include any explanation outside of code blocks."
     )
@@ -370,12 +518,21 @@ def _revise_tests(
     content = response.get("content", "")
     revised = _parse_test_files(content)
 
-    if revised:
-        return revised
+    if not revised:
+        logger.warning("LLM returned no parsed test files on revision; keeping existing tests.")
+        return current_tests, None
 
-    logger.warning("LLM returned no parsed test files on revision; keeping existing tests.")
-    return current_tests
+    test_files: dict[str, str] = {}
+    ci_workflow: tuple[str, str] | None = None
 
+    for path, file_content in revised.items():
+        norm = path.replace("\\", "/")
+        if norm.startswith(".github/workflows/") or norm == ".gitlab-ci.yml":
+            ci_workflow = (norm, file_content)
+        else:
+            test_files[norm] = file_content
+
+    return test_files if test_files else current_tests, ci_workflow
 
 
 def _parse_test_files(llm_output: str) -> dict[str, str]:

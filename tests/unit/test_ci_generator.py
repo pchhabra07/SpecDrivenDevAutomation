@@ -5,6 +5,8 @@ import pytest
 
 from orchestrator.ci_generator import (
     ensure_target_ci_workflow,
+    find_existing_ci_workflow,
+    generate_fallback_ci,
     generate_target_repo_ci,
     get_target_ci_filename,
     get_target_repo_name,
@@ -25,11 +27,19 @@ def test_get_target_ci_filename():
 
 
 def test_generate_target_repo_ci():
-    path, content = generate_target_repo_ci("pchhabra07/Full-Stack-To-Do-List")
+    path, content = generate_target_repo_ci("pchhabra07/Full-Stack-To-Do-List", stack="node")
     assert path == ".github/workflows/full-stack-to-do-list-ci.yml"
     assert "Full-Stack-To-Do-List CI Validation" in content
     assert "automation/**" in content
-    assert "@testing-library/dom" in content
+    assert "workflow_dispatch" in content
+    assert "concurrency" in content
+
+
+def test_generate_fallback_ci_python():
+    path, content = generate_fallback_ci("my-org/backend", stack="python")
+    assert path == ".github/workflows/backend-ci.yml"
+    assert "actions/setup-python@v5" in content
+    assert "pytest" in content
 
 
 def test_has_target_ci_workflow_from_file_paths():
@@ -51,6 +61,17 @@ def test_has_target_ci_workflow_from_vcs_tree():
     exists, path = has_target_ci_workflow(client, "main", all_file_paths=[])
     assert exists is True
     assert path == ".github/workflows/test.yml"
+
+
+def test_find_existing_ci_workflow():
+    client = MagicMock()
+    client.get_file_content.return_value = "name: Existing CI\njobs: []"
+    all_paths = [".github/workflows/ci.yml"]
+
+    path, content = find_existing_ci_workflow(client, "main", all_file_paths=all_paths)
+    assert path == ".github/workflows/ci.yml"
+    assert content == "name: Existing CI\njobs: []"
+    client.get_file_content.assert_called_once_with(".github/workflows/ci.yml", ref="main")
 
 
 def test_ensure_target_ci_workflow_creates_when_missing():

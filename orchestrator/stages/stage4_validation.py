@@ -217,6 +217,13 @@ def _map_gate_statuses(
                 logger.info(
                     "SonarQube not configured — skipping quality-gate check."
                 )
+            elif ci_result.passed and job_name in ("lint", "sast", "dependency-scan"):
+                status = "skipped"
+                required = False
+                logger.info(
+                    "Gate '%s' not defined in repository CI — skipped as pipeline succeeded.",
+                    job_name,
+                )
             else:
                 status = "unknown"
                 logger.warning(

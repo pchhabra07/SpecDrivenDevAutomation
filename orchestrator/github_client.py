@@ -99,9 +99,18 @@ class GitHubClient:
 
     @property
     def default_workflow_file(self) -> str:
-        """Dynamic default workflow file named after the repository."""
+        """Dynamic default workflow file: discovers any workflow in .github/workflows or falls back to repo name."""
         if self._workflow_file:
             return self._workflow_file
+        try:
+            tree = self.get_file_tree(ref=self.get_default_branch(), path=".github/workflows")
+            for entry in tree:
+                p = entry.path.replace("\\", "/")
+                if p.endswith(".yml") or p.endswith(".yaml"):
+                    import os
+                    return os.path.basename(p)
+        except Exception:
+            pass
         from orchestrator.ci_generator import get_target_ci_filename
         return get_target_ci_filename(self._repo_name)
 
@@ -395,22 +404,34 @@ class GitHubClient:
         issue = self._repo.get_issue(pr_number)
         for c in issue.get_comments():
             author = c.user.login if c.user else "user"
+            user_type = getattr(c.user, "type", "")
+            is_bot = (
+                user_type == "Bot"
+                or author.endswith("[bot]")
+                or author in ("github-actions", "codecov", "sonarcloud")
+            )
             notes.append({
                 "author": author,
                 "body": c.body or "",
                 "created_at": c.created_at,
-                "system": False,
+                "system": is_bot,
             })
 
         # Review comments
         for r in pr.get_reviews():
             if r.body and r.body.strip():
                 author = r.user.login if r.user else "reviewer"
+                user_type = getattr(r.user, "type", "")
+                is_bot = (
+                    user_type == "Bot"
+                    or author.endswith("[bot]")
+                    or author in ("github-actions", "codecov", "sonarcloud")
+                )
                 notes.append({
                     "author": author,
                     "body": r.body,
                     "created_at": r.submitted_at,
-                    "system": False,
+                    "system": is_bot,
                 })
 
         return notes
@@ -443,6 +464,23 @@ class GitHubClient:
         Trigger or find the active GitHub Actions workflow run on *branch*.
         """
         target_file = workflow_name_or_file or self.default_workflow_file
+
+        # Check if push already triggered an active run for this commit
+        if commit_sha and not inputs:
+            try:
+                runs = list(self._repo.get_workflow_runs(branch=branch))
+                for run in runs[:5]:
+                    if run.head_sha == commit_sha:
+                        logger.info(
+                            "Reusing workflow run %d triggered on push for commit %s on %s",
+                            run.id,
+                            commit_sha[:8],
+                            branch,
+                        )
+                        return run.id
+            except Exception:
+                pass
+
         try:
             workflow = self._repo.get_workflow(target_file)
             workflow.create_dispatch(ref=branch, inputs=inputs or {})

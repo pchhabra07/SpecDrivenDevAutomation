@@ -193,12 +193,27 @@ def run(
 
     # ── 5. Gate 2 Human Approval Monitoring Loop ─────────────────────────
     logger.info("Waiting for Gate 2 Human Approval (PR #%s)…", mr_iid)
+    seen_comments: set[str] = set()
+
+    # Pre-seed seen_comments with any comments already present on the PR
+    if hasattr(gitlab, "get_pr_notes"):
+        for n in gitlab.get_pr_notes(mr_iid):
+            b = (n.get("body") or "").strip()
+            if b:
+                seen_comments.add(b)
+    elif hasattr(gitlab, "get_mr_notes"):
+        for n in gitlab.get_mr_notes(mr_iid):
+            b = (n.get("body") or "").strip()
+            if b:
+                seen_comments.add(b)
+
     gate_result: GateResult = wait_for_approval(
         gitlab=gitlab,
         mr_iid=mr_iid,
         poll_interval_seconds=gate_poll_interval,
         timeout_hours=gate_timeout_hours,
         return_on_changes_requested=True,
+        seen_comments=seen_comments,
     )
 
     if gate_result.outcome == GateOutcome.APPROVED:

@@ -45,7 +45,7 @@ def wait_for_approval(
     seen_comments: set[str] | None = None,
 ) -> GateResult:
     """
-    Poll a GitHub PR's approval state until it is approved or times out.
+    Poll a GitHub PR's approval state until it is approved, changes are requested, or it times out.
     """
     if seen_comments is None:
         seen_comments = set()
@@ -65,6 +65,18 @@ def wait_for_approval(
             )
             logger.info("PR #%d APPROVED by %s", pr_number, result.approved_by)
             return result
+
+        # Check for explicit CHANGES_REQUESTED review state
+        if return_on_changes_requested and approvals.get("changes_requested"):
+            all_comments = _fetch_comments(client, pr_number)
+            new_comments = [c for c in all_comments if c not in seen_comments]
+            seen_comments.update(all_comments)
+            logger.info("PR #%d has explicit CHANGES_REQUESTED review state", pr_number)
+            return GateResult(
+                outcome=GateOutcome.CHANGES_REQUESTED,
+                approved_by=[],
+                reviewer_comments=new_comments or ["Reviewer requested changes on pull request."],
+            )
 
         # Check for NEW reviewer comments that signal change requests
         all_comments = _fetch_comments(client, pr_number)
@@ -94,6 +106,12 @@ def _fetch_comments(client: Any, pr_number: int) -> list[str]:
     for n in notes:
         if n.get("system"):
             continue
+        author = str(n.get("author") or "").lower()
+        if (
+            author.endswith("[bot]")
+            or author in ("github-actions", "codecov", "sonarcloud", "dependabot")
+        ):
+            continue
         body = (n.get("body") or "").strip()
         if not body:
             continue
@@ -101,4 +119,3 @@ def _fetch_comments(client: Any, pr_number: int) -> list[str]:
             continue
         comments.append(body)
     return comments
-

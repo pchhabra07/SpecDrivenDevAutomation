@@ -47,6 +47,19 @@ class TestDetectProjectStack:
         ctx = _make_context(["requirements.txt", "main.py"])
         assert _detect_project_stack(ctx) == "python"
 
+    def test_python_with_html_templates_detected_as_python_not_static(self):
+        # A Django or Flask app with HTML templates should be detected as Python
+        ctx = _make_context(["templates/index.html", "static/style.css", "app.py", "requirements.txt"])
+        assert _detect_project_stack(ctx) == "python"
+
+    def test_detects_java(self):
+        ctx = _make_context(["pom.xml", "src/main/java/App.java"])
+        assert _detect_project_stack(ctx) == "java"
+
+    def test_detects_go(self):
+        ctx = _make_context(["go.mod", "main.go"])
+        assert _detect_project_stack(ctx) == "go"
+
 
 class TestGenerateTestsPrompt:
     def test_static_web_prompt_contains_prohibitions(self):
@@ -58,7 +71,7 @@ class TestGenerateTestsPrompt:
             all_paths=["index.html", "style.css"],
             source_files={"style.css": "body { background-color: white; }"},
         )
-        tests = _generate_tests(mock_llm, ctx)
+        tests, ci = _generate_tests(mock_llm, ctx)
 
         assert "tests/background.test.js" in tests
         call_prompt = mock_llm.chat.call_args[0][0]
@@ -66,11 +79,29 @@ class TestGenerateTestsPrompt:
         assert "DO NOT generate tests for `package.json`" in call_prompt
         assert "DO NOT import React" in call_prompt
 
+    def test_generates_workflow_alongside_tests(self):
+        mock_llm = MagicMock()
+        mock_llm.chat.return_value = {
+            "content": (
+                "// FILE: tests/test_app.py\ndef test_feature(): pass\n\n"
+                "// FILE: .github/workflows/ci.yml\nname: CI\njobs: []\n"
+            )
+        }
+        ctx = _make_context(
+            all_paths=["app.py", "requirements.txt"],
+            source_files={"app.py": "def run(): pass"},
+        )
+        tests, ci = _generate_tests(mock_llm, ctx)
+
+        assert "tests/test_app.py" in tests
+        assert ci is not None
+        assert ci[0] == ".github/workflows/ci.yml"
+        assert "name: CI" in ci[1]
+
 
 class TestReviseTests:
     def test_revised_tests_drops_removed_files(self):
         mock_llm = MagicMock()
-        # Reviewer asked to remove App.test.tsx, so LLM only returns the remaining test
         mock_llm.chat.return_value = {
             "content": "// FILE: tests/background.test.js\nconst fs = require('fs');\n"
         }
@@ -79,7 +110,7 @@ class TestReviseTests:
             "src/__tests__/App.test.tsx": "import React from 'react';",
             "tests/background.test.js": "// old test",
         }
-        revised = _revise_tests(
+        revised, ci = _revise_tests(
             llm=mock_llm,
             context=ctx,
             current_tests=current,

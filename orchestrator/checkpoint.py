@@ -44,6 +44,7 @@ class Checkpoint:
     reviewer_feedback: list[str] = field(default_factory=list)
     final_mr_url: str = ""
     repo_id: str | int | None = None
+    ci_workflow_path: str = ""
 
     # ── Persistence ─────────────────────────────────────────────────────
 

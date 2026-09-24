@@ -138,7 +138,8 @@ def run_pipeline(
     checkpoint = Checkpoint.load(ticket_id, settings.checkpoint_dir)
     if checkpoint:
         if checkpoint.repo_id and str(checkpoint.repo_id) != str(gitlab.project_id):
-            if repo_resolver and repo_resolver.resolve(ticket_id) == checkpoint.repo_id:
+            mapped_repos = set(str(v) for v in repo_resolver.mapping.values()) if repo_resolver else set()
+            if str(checkpoint.repo_id) in mapped_repos:
                 logger.info("Resuming ticket in mapped repository ID %s", checkpoint.repo_id)
                 gitlab.switch_project(checkpoint.repo_id)
             else:
@@ -343,6 +344,7 @@ def run_pipeline(
                 llm.append_user_message(feedback_prompt)
                 checkpoint.conversation_history = llm.history
                 checkpoint.current_stage = 3
+                checkpoint.iteration_count = 0
                 checkpoint.save(settings.checkpoint_dir)
                 continue
 

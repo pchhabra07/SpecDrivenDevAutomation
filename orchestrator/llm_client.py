@@ -45,6 +45,7 @@ class LLMClient:
         enable_context_pruning: bool = False,
         max_context_tokens: int = 16000,
         timeout: float = 120.0,
+        audit_logger: Any | None = None,
     ) -> None:
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self._model = model
@@ -52,6 +53,8 @@ class LLMClient:
         self._rate_limiter = rate_limiter
         self._enable_context_pruning = enable_context_pruning
         self._max_context_tokens = max_context_tokens
+        self._audit_logger = audit_logger
+        self._last_call_metadata: dict[str, Any] = {}
 
         self._history: list[dict[str, Any]] = []
         if system_prompt:
@@ -61,21 +64,43 @@ class LLMClient:
 
     # ── Public API ──────────────────────────────────────────────────────
 
+    def set_audit_logger(self, audit_logger: Any) -> None:
+        """Attach an AuditLogger instance for tracing LLM prompts and responses."""
+        self._audit_logger = audit_logger
+
     def chat(
         self,
         user_message: str,
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
+        stage: int = 0,
+        call_purpose: str = "",
+        attached_files: list[str] | dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
         Send a user message and return the assistant's response message dict.
 
         Automatically appends both the user message and the assistant
-        response to the conversation history.
+        response to the conversation history, and logs the interaction
+        to the audit tracer if configured.
         """
         self._history.append({"role": "user", "content": user_message})
         response_msg = self._call_with_retry(tools=tools, temperature=temperature)
         self._history.append(response_msg)
+
+        if self._audit_logger:
+            last_meta = getattr(self, "_last_call_metadata", {})
+            self._audit_logger.log_llm_interaction(
+                stage=stage,
+                prompt=user_message,
+                response=response_msg,
+                model=last_meta.get("model", self._model),
+                latency_seconds=last_meta.get("elapsed", 0.0),
+                usage=last_meta.get("usage", {}),
+                attached_files=attached_files,
+                call_purpose=call_purpose,
+            )
+
         return response_msg
 
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
@@ -90,6 +115,9 @@ class LLMClient:
         self,
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
+        stage: int = 0,
+        call_purpose: str = "",
+        attached_files: list[str] | dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
         Continue the conversation after tool results have been added.
@@ -99,6 +127,20 @@ class LLMClient:
         """
         response_msg = self._call_with_retry(tools=tools, temperature=temperature)
         self._history.append(response_msg)
+
+        if self._audit_logger:
+            last_meta = getattr(self, "_last_call_metadata", {})
+            self._audit_logger.log_llm_interaction(
+                stage=stage,
+                prompt="[Continue after tool calls]",
+                response=response_msg,
+                model=last_meta.get("model", self._model),
+                latency_seconds=last_meta.get("elapsed", 0.0),
+                usage=last_meta.get("usage", {}),
+                attached_files=attached_files,
+                call_purpose=call_purpose or "Tool call continuation",
+            )
+
         return response_msg
 
     # ── History management ──────────────────────────────────────────────
@@ -164,6 +206,14 @@ class LLMClient:
                 usage = getattr(response, "usage", None)
                 tokens_info = f" (prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens})" if usage else ""
                 logger.info("LLM responded in %.1fs%s", elapsed, tokens_info)
+                self._last_call_metadata = {
+                    "model": model,
+                    "elapsed": elapsed,
+                    "usage": {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                        "completion_tokens": getattr(usage, "completion_tokens", 0),
+                    } if usage else {},
+                }
                 self._consecutive_failures = 0
                 return msg
 

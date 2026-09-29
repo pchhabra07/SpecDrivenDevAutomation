@@ -298,7 +298,12 @@ def _rank_relevant_files(
         f"no explanation.  Only return paths from the list above."
     )
 
-    response = llm.chat(prompt)
+    response = llm.chat(
+        prompt,
+        stage=1,
+        call_purpose="Rank relevant source files",
+        attached_files=paths,
+    )
     content = response.get("content", "")
 
     selected: list[str] = []

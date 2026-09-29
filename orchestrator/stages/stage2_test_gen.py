@@ -355,6 +355,8 @@ def _generate_tests(
             "- Use `pytest` for test cases.\n"
             "- Follow naming convention: `tests/test_<feature>.py`.\n"
             "- Directly test functions, classes, or endpoints specified in the acceptance criteria.\n"
+            "- Assert specific expected return values, schemas, error exceptions, and side-effects.\n"
+            "- STRICTLY FORBIDDEN: Writing trivial tests like `assert result is not None`, `assert True`, or mocking away the logic being tested.\n"
             "- DO NOT import JavaScript, Jest, React, or npm modules.\n"
         )
     elif stack == "react":
@@ -362,7 +364,9 @@ def _generate_tests(
             "### Technology Stack: React\n"
             "- Use Jest / Vitest + React Testing Library.\n"
             "- Follow naming convention: `<module>.test.tsx` or `<module>.test.ts`.\n"
-            "- Test component behavior and UI elements specified in the acceptance criteria.\n"
+            "- Test component behavior, user events (clicks, typing), props, and rendered UI elements.\n"
+            "- Assert real visible text, rendered data, and state updates matching acceptance criteria.\n"
+            "- STRICTLY FORBIDDEN: Shallow snapshot tests or tests that merely verify an empty wrapper div rendered.\n"
             "- DO NOT generate irrelevant tests for package managers or environment setup.\n"
         )
     elif stack == "node":
@@ -370,6 +374,9 @@ def _generate_tests(
             "### Technology Stack: Node.js / JavaScript\n"
             "- Use Jest / Vitest or the repo's existing test framework.\n"
             "- Follow naming convention: `<module>.test.ts` or `<module>.test.js`.\n"
+            "- Directly test business logic, routes, and data transformations.\n"
+            "- Assert exact payloads, HTTP status codes, and error conditions.\n"
+            "- STRICTLY FORBIDDEN: Trivial tests that merely check if an endpoint exists without verifying its returned data.\n"
             "- DO NOT generate irrelevant tests for package managers or environment setup.\n"
         )
     elif stack == "java":
@@ -377,24 +384,32 @@ def _generate_tests(
             "### Technology Stack: Java\n"
             "- Use JUnit 5 for test cases.\n"
             "- Follow standard Maven/Gradle naming: `src/test/java/.../*Test.java`.\n"
+            "- Assert explicit business logic, return values, and contract requirements.\n"
+            "- STRICTLY FORBIDDEN: Dummy assertions like `assertTrue(true)` or `assertNotNull(obj)` without value checks.\n"
         )
     elif stack == "go":
         stack_instructions = (
             "### Technology Stack: Go\n"
             "- Use standard Go `testing` package.\n"
             "- Follow naming convention: `<package>_test.go`.\n"
+            "- Assert concrete outputs, error types, and boundary conditions.\n"
         )
     elif stack == "rust":
         stack_instructions = (
             "### Technology Stack: Rust\n"
             "- Use standard Rust test modules (`#[cfg(test)]`) or `tests/<feature>_test.rs`.\n"
+            "- Assert explicit state mutations, return values, and error variants with strict `assert_eq!`.\n"
         )
     elif stack == "static_web":
         stack_instructions = (
             "### Technology Stack: Static Web (HTML/CSS/Vanilla JS)\n"
             "- This repository is a static frontend project (HTML, CSS, assets). There is NO backend and NO package.json.\n"
             f"- Available source files in repo: {', '.join(f'`{k}`' for k in context.source_files.keys())}.\n"
-            "- Generate a simple, focused test file (e.g. `tests/test_ui.py` with BeautifulSoup or `tests/test_ui.js` with fs) that inspects DOM/CSS to assert that acceptance criteria are met.\n"
+            "- Generate a simple, focused test file (e.g. `tests/test_ui.py` with BeautifulSoup) that inspects DOM/CSS to assert that acceptance criteria are met.\n"
+            "- CRITICAL TESTING RULES FOR UI/CSS:\n"
+            "  * NEVER write tests that only check for the presence of a class name (e.g. class='dark-mode').\n"
+            "  * ALWAYS assert actual CSS properties (e.g. background-color, color, contrast) or stylesheet rules.\n"
+            "  * ALWAYS assert that existing page content, sections, and structural elements remain present and intact.\n"
             "- STRICT PROHIBITIONS:\n"
             "  * DO NOT generate tests for `package.json`, `package-lock.json`, or node_modules.\n"
             "  * DO NOT import React, ReactDOM, or `@testing-library/react`.\n"
@@ -405,6 +420,7 @@ def _generate_tests(
             "### Technology Stack: Multi-Language / Generic\n"
             "- Inspect the existing repository files and test frameworks.\n"
             "- Write tests matching the repository's native conventions.\n"
+            "- Assert real functional outputs and data transformations; never write dummy assertions.\n"
         )
 
     # CI Workflow instructions
@@ -457,11 +473,16 @@ def _generate_tests(
         "## Stack & Testing Guidelines\n"
         f"{stack_instructions}\n\n"
         f"{ci_instructions}\n"
-        "## Core Principles\n"
+        "## Core Principles (MANDATORY ACROSS ALL TECH STACKS)\n"
         "1. Every single test MUST directly verify an acceptance criterion from the ticket.\n"
-        "2. Keep test cases minimal, focused, and free of useless boilerplate.\n"
-        "3. Do NOT test things unrelated to the ticket (e.g. do not test build configurations or lockfiles).\n"
-        "4. Follow the existing project structure and reference actual repository file paths.\n\n"
+        "2. REAL FUNCTIONAL ASSERTIONS (ZERO TOLERANCE FOR SUPERFICIAL TESTS):\n"
+        "   - Assert exact return values, response payloads, state changes, computed styles, or DOM hierarchy.\n"
+        "   - STRICTLY FORBIDDEN: Writing trivial assertions that pass without real implementation (e.g. `assert obj is not None`, `assertTrue(true)`, checking only a class name or tag without checking styles/content, or over-mocking the very unit under test).\n"
+        "3. REGRESSION CHECKS: Assert that existing core components, layouts, APIs, and structures remain intact after changes are introduced.\n"
+        "4. EDGE CASES & ERROR PATHS: Include tests for invalid inputs, missing data, or boundary conditions if applicable.\n"
+        "5. Keep test cases minimal, focused, and free of useless boilerplate.\n"
+        "6. Do NOT test things unrelated to the ticket (e.g. do not test build configurations or lockfiles).\n"
+        "7. Follow the existing project structure and reference actual repository file paths.\n\n"
         "## Output Format\n"
         "Return your answer as one or more fenced code blocks, each preceded by a single-line file path comment like:\n"
         "```\n"
@@ -471,7 +492,12 @@ def _generate_tests(
         "Do not include any explanation outside of code blocks."
     )
 
-    response = llm.chat(prompt)
+    response = llm.chat(
+        prompt,
+        stage=2,
+        call_purpose="Generate pre-development tests and CI workflow",
+        attached_files=list(context.source_files.keys()),
+    )
     content = response.get("content", "")
     all_files = _parse_test_files(content)
 
@@ -514,7 +540,12 @@ def _revise_tests(
         "6. Do not include any explanation outside of code blocks."
     )
 
-    response = llm.chat(prompt)
+    response = llm.chat(
+        prompt,
+        stage=2,
+        call_purpose="Revise tests per Gate 1 reviewer feedback",
+        attached_files=list(current_tests.keys()),
+    )
     content = response.get("content", "")
     revised = _parse_test_files(content)
 

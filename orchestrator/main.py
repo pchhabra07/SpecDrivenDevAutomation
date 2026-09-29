@@ -133,6 +133,7 @@ def run_pipeline(
     repo_resolver = RepoResolver(settings.repo_mapping)
 
     audit = AuditLogger(ticket_id=ticket_id, audit_dir=settings.audit_dir)
+    llm.set_audit_logger(audit)
 
     # ── Checkpoint: resume or create ────────────────────────────────────
     checkpoint = Checkpoint.load(ticket_id, settings.checkpoint_dir)
@@ -254,6 +255,7 @@ def run_pipeline(
                     ci_timeout_minutes=settings.ci_timeout_minutes,
                     slack_webhook_url=settings.slack_webhook_url,
                     escalation_email=settings.escalation_email,
+                    reviewer_feedback=checkpoint.reviewer_feedback,
                 )
                 checkpoint.conversation_history = llm.history
                 checkpoint.save(settings.checkpoint_dir)
@@ -330,6 +332,7 @@ def run_pipeline(
                     return 1
 
                 checkpoint.review_iteration_count += 1
+                checkpoint.reviewer_feedback = stage5_result.reviewer_feedback
                 logger.info(
                     "Reviewer requested changes (cycle %d/%d). Re-routing to Stage 3.",
                     checkpoint.review_iteration_count,

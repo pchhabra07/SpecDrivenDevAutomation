@@ -50,6 +50,7 @@ def run(
     ci_timeout_minutes: int = 30,
     slack_webhook_url: str = "",
     escalation_email: str = "",
+    reviewer_feedback: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Execute Stage 3: iterative code generation with tamper-checking.
@@ -128,6 +129,7 @@ def run(
         )
 
         # ── 1. Prompt the LLM ────────────────────────────────────────
+        active_reviewer_feedback = reviewer_feedback or getattr(checkpoint, "reviewer_feedback", [])
         logger.info("LLM call: generating code changes…")
         t0 = _time.monotonic()
         generated_files = _generate_code(
@@ -137,6 +139,7 @@ def run(
             last_test_output=last_test_output,
             iteration=iteration,
             blocked_paths=blocked_paths,
+            reviewer_feedback=active_reviewer_feedback,
         )
         elapsed = _time.monotonic() - t0
         logger.info("LLM responded in %.1fs with %d file(s)", elapsed, len(generated_files) if generated_files else 0)
@@ -303,6 +306,7 @@ def _generate_code(
     iteration: int,
     blocked_paths: set[str] | None = None,
     locked_paths: set[str] | None = None,
+    reviewer_feedback: list[str] | None = None,
 ) -> dict[str, str]:
     """
     Prompt the LLM to generate code changes and parse the response.
@@ -327,6 +331,25 @@ def _generate_code(
             for path, content in list(context.test_files.items())[:10]
         )
 
+    # Human Approver Review Feedback (Gate 2 loop)
+    feedback_section = ""
+    if reviewer_feedback:
+        fb_list = "\n".join(f"- {c}" for c in reviewer_feedback)
+        feedback_section = (
+            "## 🚨 PRIMARY OBJECTIVE: Human Approver Review Feedback\n"
+            "A human reviewer has reviewed the previous Pull Request and explicitly requested the following improvements.\n"
+            "Satisfying ALL points below is your PRIMARY target. Making tests pass is secondary:\n"
+            f"{fb_list}\n\n"
+        )
+
+    task_desc = (
+        "Your PRIMARY task is to address all points raised in the Human Approver's review feedback, "
+        "while ensuring all locked tests pass without regressions."
+        if reviewer_feedback
+        else "Your task is to implement clean, targeted code changes that satisfy the ticket's acceptance criteria "
+        "and make the locked test suite pass."
+    )
+
     # Previous iteration context.
     iteration_context = ""
     if last_test_output and iteration > 1:
@@ -344,28 +367,31 @@ def _generate_code(
 
     has_react = any("react" in p.lower() or p.endswith((".tsx", ".jsx")) for p in context.all_file_paths)
     react_hint = (
-        "5. In React components, ensure hooks that require external providers (such as useNavigate from react-router) "
+        "6. In React components, ensure hooks that require external providers (such as useNavigate from react-router) "
         "are safely handled with a fallback so components can be rendered in isolated unit tests.\n"
         if has_react
         else ""
     )
 
     prompt = (
-        "You are a senior software engineer.  Your task is to implement code "
-        "changes that make the locked test suite pass.\n\n"
+        "You are a senior software engineer. "
+        f"{task_desc}\n\n"
         "## Ticket\n"
         f"**ID:** {ticket.ticket_id}\n"
         f"**Summary:** {ticket.summary}\n"
         f"**Description:**\n{ticket.description}\n\n"
         f"**Acceptance Criteria:**\n{ticket.acceptance_criteria}\n\n"
+        f"{feedback_section}"
         f"{iteration_context}"
         f"## Current Source Files\n{source_summary}\n\n"
         f"{locked_tests_summary}\n\n"
         "## Critical Rules\n"
-        "1. You MUST NOT modify any locked test files or CI workflow files. They are immutable.\n"
-        "2. Only create or modify implementation source files.\n"
-        "3. Your code must make all the locked tests pass.\n"
-        "4. Follow existing code conventions and patterns in the repository.\n"
+        "1. TARGETED & SURGICAL EDITS: Identify the exact lines, rules, or functions that require changes. "
+        "Do NOT rewrite entire files or recreate layouts from scratch unless strictly required. Keep the blast radius minimal.\n"
+        "2. PRESERVE EXISTING ARCHITECTURE & STYLING: You MUST preserve all existing layout structures (e.g. flex/grid splits, column widths, fixed sizes, sticky positioning, responsive breakpoints) and unrelated components. Do NOT remove, rename, or disturb working layout properties.\n"
+        "3. IMMUTABLE FILES: You MUST NOT modify any locked test files or CI workflow files. They are immutable.\n"
+        "4. SATISFY HUMAN FEEDBACK & SPEC: Satisfy all human reviewer comments and acceptance criteria, while ensuring all locked tests pass.\n"
+        "5. ONLY EMIT MODIFIED FILES: Only return files that actually require changes. Do not re-emit files that are unchanged.\n"
         f"{react_hint}\n"
         "## Output Format\n"
         "Return your answer as one or more fenced code blocks, each preceded by "
@@ -378,7 +404,12 @@ def _generate_code(
     )
 
     for attempt in range(1, _MAX_LOCKED_REJECTIONS + 1):
-        response = llm.chat(prompt)
+        response = llm.chat(
+            prompt,
+            stage=3,
+            call_purpose=f"Code generation iteration {iteration} (attempt {attempt})",
+            attached_files=list(current_sources.keys()),
+        )
         content = response.get("content", "")
         files = _parse_generated_files(content)
 

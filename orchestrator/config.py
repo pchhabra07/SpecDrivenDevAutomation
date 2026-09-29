@@ -172,11 +172,11 @@ class Settings(BaseSettings):
         description="JSON string mapping components/labels to target repository identifiers",
     )
     enable_context_pruning: bool = Field(
-        True,
-        description="Enable automatic sliding-window pruning for long LLM transcripts",
+        False,
+        description="Enable automatic sliding-window pruning for long LLM transcripts (default: False)",
     )
     max_context_tokens: int = Field(
-        16000,
+        131072,
         description="Maximum estimated token threshold before older iterations are summarized",
     )
 

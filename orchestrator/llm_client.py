@@ -165,6 +165,55 @@ class LLMClient:
         """Manually append a user message (e.g. reviewer feedback) to history."""
         self._history.append({"role": "user", "content": content})
 
+    def chat_once(
+        self,
+        user_message: str,
+        temperature: float = 0.2,
+        stage: int = 0,
+        call_purpose: str = "",
+        attached_files: list[str] | dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Make a fully stateless, one-shot LLM call.
+
+        Unlike ``chat()``, this does NOT append messages to ``self._history``.
+        It builds a temporary message list (system prompt only + user message),
+        calls the LLM, and returns the response.  The conversation history is
+        left completely untouched.
+
+        Use this for self-contained sub-calls (e.g. Stage 2 revision cycles)
+        where accumulating the full back-and-forth in history would cause token
+        explosion across successive revision attempts.
+        """
+        # Build an isolated messages list: system prompt (if any) + single user turn
+        ephemeral_history = []
+        if self._history and self._history[0]["role"] == "system":
+            ephemeral_history.append(self._history[0])
+        ephemeral_history.append({"role": "user", "content": user_message})
+
+        # Temporarily swap history so _call_with_retry uses the ephemeral list
+        saved_history = self._history
+        self._history = ephemeral_history
+        try:
+            response_msg = self._call_with_retry(tools=None, temperature=temperature)
+        finally:
+            self._history = saved_history
+
+        if self._audit_logger:
+            last_meta = getattr(self, "_last_call_metadata", {})
+            self._audit_logger.log_llm_interaction(
+                stage=stage,
+                prompt=user_message,
+                response=response_msg,
+                model=last_meta.get("model", self._model),
+                latency_seconds=last_meta.get("elapsed", 0.0),
+                usage=last_meta.get("usage", {}),
+                attached_files=attached_files,
+                call_purpose=call_purpose or "Ephemeral one-shot call",
+            )
+
+        return response_msg
+
     # ── Internals ───────────────────────────────────────────────────────
 
     def _active_model(self) -> str:

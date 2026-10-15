@@ -35,6 +35,7 @@ from orchestrator.stages import (
     stage4_validation,
     stage5_pr,
 )
+from orchestrator.stages.stage1_context import refresh_context_for_feedback
 
 logger = logging.getLogger("orchestrator")
 
@@ -338,13 +339,23 @@ def run_pipeline(
                     checkpoint.review_iteration_count,
                     settings.max_review_iterations,
                 )
-                feedback_prompt = (
-                    f"Reviewer feedback on MR !{checkpoint.draft_mr_iid}:\n"
-                    + "\n".join(f"- {c}" for c in stage5_result.reviewer_feedback)
-                    + "\n\nPlease modify the source code to address the reviewer's feedback. "
-                    "Do NOT modify any locked test files."
+
+                # Phase 2: Expand context with files referenced by reviewer.
+                logger.info("Phase 2: Expanding context for reviewer feedback…")
+                refresh_context_for_feedback(
+                    reviewer_feedback=stage5_result.reviewer_feedback,
+                    context=context,
+                    gitlab=gitlab,
+                    audit=audit,
                 )
-                llm.append_user_message(feedback_prompt)
+
+                # Issue 12 fix: DO NOT call llm.append_user_message(feedback_prompt) here.
+                # Stage 3's _generate_code() already injects reviewer_feedback via its
+                # own feedback_section in the prompt. Injecting here too causes the
+                # feedback to appear twice per iteration (4x after cycle 2, 6x after
+                # cycle 3...) and gets truncated by context_pruner to unreadable snippets.
+                # The reviewer feedback is stored in checkpoint.reviewer_feedback and
+                # passed explicitly to stage3_code_gen.run() via the reviewer_feedback arg.
                 checkpoint.conversation_history = llm.history
                 checkpoint.current_stage = 3
                 checkpoint.iteration_count = 0

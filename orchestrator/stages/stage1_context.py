@@ -17,6 +17,11 @@ from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
+from orchestrator.code_search import (
+    extract_symbols_from_text,
+    find_additional_context_files,
+    search_repository_for_symbols,
+)
 from orchestrator.jira_client import TicketData
 from orchestrator.llm_client import LLMClient
 from orchestrator.repo_resolver import RepoResolver
@@ -214,17 +219,30 @@ def run(
             logger.warning("Could not fetch test file %s: %s", path, exc)
 
     # ── 5. Rank source files by relevance to the ticket ────────────────
-    # For small repos, just fetch everything.  For large repos, use the
-    # LLM to pick the most relevant files.
-    if len(source_paths) <= 30:
-        relevant_paths = source_paths
+    # Issue 8 fix: Always run symbol extraction + LLM ranking regardless of
+    # repo size. The old "<= 30 files → send everything" path caused the LLM
+    # to receive all files with zero filtering, burning token budget and
+    # confusing it with irrelevant files.
+    ticket_text = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
+    symbols = extract_symbols_from_text(ticket_text)
+    if symbols:
+        logger.info("Extracted %d symbols from ticket: %s", len(symbols), symbols[:15])
+
+    if len(source_paths) <= 10:
+        # Very small repos: take all files but still sort by symbol relevance.
+        relevant_paths = _sort_by_symbol_relevance(source_paths, symbols)
     else:
-        logger.info("Large codebase (%d files). Calling LLM to rank relevance…", len(source_paths))
+        logger.info(
+            "Running symbol scan + LLM ranking on %d source file(s)…", len(source_paths)
+        )
         relevant_paths = _rank_relevant_files(
             llm, ticket, source_paths, max_files=30,
         )
 
     logger.info("Fetching %d relevant source file(s)…", len(relevant_paths))
+    # Issue 9 fix: Preserve relevance order when building the dict.
+    # downstream [:15] slices now get the TOP-ranked files, not the
+    # alphabetically-first files.
     source_files: dict[str, str] = {}
     for path in relevant_paths:
         try:
@@ -272,6 +290,25 @@ def _is_source_file(path: str) -> bool:
     return any(fnmatch.fnmatch(basename, pat) for pat in _SOURCE_EXTENSIONS)
 
 
+def _sort_by_symbol_relevance(paths: list[str], symbols: list[str]) -> list[str]:
+    """
+    Issue 8/9 helper: Sort file paths so that files whose names/paths contain
+    ticket symbols (CSS class names, function names, component IDs) come first.
+    Files with no symbol match retain their original order at the end.
+    Used for very small repos where LLM ranking would be overkill.
+    """
+    if not symbols:
+        return list(paths)
+    symbols_lower = [s.lower() for s in symbols]
+
+    def score(path: str) -> int:
+        p_lower = path.lower()
+        return sum(1 for s in symbols_lower if s in p_lower)
+
+    return sorted(paths, key=score, reverse=True)
+
+
+
 def _rank_relevant_files(
     llm: LLMClient,
     ticket: TicketData,
@@ -283,7 +320,19 @@ def _rank_relevant_files(
 
     Sends a lightweight prompt with the file list and ticket summary;
     asks the model to return the top-N most likely relevant paths.
+    The prompt is enriched with extracted symbols from the ticket text
+    to help the LLM make better relevance decisions (Phase 2).
     """
+    ticket_text = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
+    symbols = extract_symbols_from_text(ticket_text)
+    symbol_hint = ""
+    if symbols:
+        symbol_hint = (
+            f"\n## Extracted Symbols (CSS classes, function names, components from ticket)\n"
+            f"{', '.join(symbols[:30])}\n"
+            f"Give higher priority to files that contain these symbols.\n"
+        )
+
     paths_text = "\n".join(paths)
     prompt = (
         "You are a code analysis assistant.  Given the following ticket "
@@ -293,6 +342,7 @@ def _rank_relevant_files(
         f"**Summary:** {ticket.summary}\n"
         f"**Description:** {ticket.description}\n"
         f"**Acceptance Criteria:** {ticket.acceptance_criteria}\n\n"
+        f"{symbol_hint}"
         f"## File Paths\n```\n{paths_text}\n```\n\n"
         f"Return up to {max_files} file paths, one per line, no numbering, "
         f"no explanation.  Only return paths from the list above."
@@ -325,3 +375,53 @@ def _rank_relevant_files(
 
     logger.info("LLM ranked %d relevant files from %d candidates", len(selected), len(paths))
     return selected
+
+
+def refresh_context_for_feedback(
+    reviewer_feedback: list[str],
+    context: "TicketContext",
+    gitlab: Any,
+    audit: "AuditLogger",
+) -> None:
+    """
+    Phase 2 Gate-2 context re-expansion.
+
+    When a human reviewer references files or symbols not included in the
+    initial Stage 1 context snapshot, this function expands the context
+    by fetching those additional files from the VCS platform.
+
+    Modifies ``context.source_files`` in-place.
+    """
+    existing_paths = set(context.source_files.keys())
+    expansion = find_additional_context_files(
+        reviewer_feedback=reviewer_feedback,
+        repo_root=".",  # No local disk access in CI -- use gitlab client.
+        existing_context_paths=existing_paths,
+        all_file_paths=context.all_file_paths,
+        gitlab=gitlab,
+        branch=context.default_branch,
+        max_new_files=10,
+    )
+
+    newly_fetched: list[str] = []
+    for path in expansion.new_files_found:
+        if path not in context.source_files:
+            try:
+                content = gitlab.get_file_content(path, ref=context.default_branch)
+                context.source_files[path] = content
+                newly_fetched.append(path)
+            except Exception as exc:
+                logger.warning("Could not fetch context-expansion file %s: %s", path, exc)
+
+    if newly_fetched:
+        logger.info(
+            "Gate-2 context expansion: added %d new file(s): %s",
+            len(newly_fetched), newly_fetched,
+        )
+        audit.log(
+            stage=1,
+            event_type="context_expanded_for_review",
+            payload={"new_files": newly_fetched, "symbols_found": len(expansion.search_hits)},
+        )
+    else:
+        logger.info("Gate-2 context expansion: no new files needed.")

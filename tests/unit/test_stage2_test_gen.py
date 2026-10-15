@@ -6,7 +6,13 @@ from unittest.mock import MagicMock
 
 from orchestrator.jira_client import TicketData
 from orchestrator.stages.stage1_context import TicketContext
-from orchestrator.stages.stage2_test_gen import _detect_project_stack, _generate_tests, _revise_tests
+from orchestrator.stages.stage2_test_gen import (
+    _check_vacuous_assertions,
+    _detect_project_stack,
+    _generate_tests,
+    _revise_tests,
+    _validate_test_imports,
+)
 
 
 def _make_context(
@@ -102,7 +108,8 @@ class TestGenerateTestsPrompt:
 class TestReviseTests:
     def test_revised_tests_drops_removed_files(self):
         mock_llm = MagicMock()
-        mock_llm.chat.return_value = {
+        # N2 fix: _revise_tests now calls chat_once() (stateless), NOT chat().
+        mock_llm.chat_once.return_value = {
             "content": "// FILE: tests/background.test.js\nconst fs = require('fs');\n"
         }
         ctx = _make_context(["index.html", "style.css"])
@@ -119,3 +126,108 @@ class TestReviseTests:
 
         assert "tests/background.test.js" in revised
         assert "src/__tests__/App.test.tsx" not in revised
+
+    def test_revise_uses_chat_once_not_chat(self):
+        """N2 fix: revision must use stateless chat_once so history doesn't balloon."""
+        mock_llm = MagicMock()
+        mock_llm.chat_once.return_value = {
+            "content": "// FILE: tests/test_ui.py\ndef test_dummy(): pass\n"
+        }
+        ctx = _make_context(["index.html", "style.css"])
+        _revise_tests(
+            llm=mock_llm,
+            context=ctx,
+            current_tests={"tests/test_ui.py": "old content"},
+            reviewer_comments=["Update assertions"],
+        )
+        # chat_once must be called; plain chat must NOT be called
+        mock_llm.chat_once.assert_called_once()
+        mock_llm.chat.assert_not_called()
+
+    def test_ci_failure_output_appears_in_revision_prompt(self):
+        """N5 fix: CI failure output must be injected into the revision prompt."""
+        mock_llm = MagicMock()
+        mock_llm.chat_once.return_value = {
+            "content": "// FILE: tests/test_ui.py\ndef test_something(): assert True\n"
+        }
+        ctx = _make_context(
+            all_paths=["index.html", "style.css"],
+            source_files={"style.css": "body { background: white; }"},
+        )
+        _revise_tests(
+            llm=mock_llm,
+            context=ctx,
+            current_tests={"tests/test_ui.py": "old"},
+            reviewer_comments=["Fix assertions"],
+            ci_failure_output="AssertionError: expected dark background\nFAILED tests/test_ui.py::test_bg",
+        )
+        prompt_sent = mock_llm.chat_once.call_args[0][0]
+        assert "CI Test Failure Output" in prompt_sent
+        assert "AssertionError: expected dark background" in prompt_sent
+
+
+# ── N3 Fix: Unconditional assertion static checker ──────────────────────
+
+
+class TestCheckVacuousAssertions:
+    """N3 fix: _check_vacuous_assertions detects tests where all asserts are
+    inside if-guards (the silent-passing bug found in Issue #10)."""
+
+    _GUARDED_ONLY = """\
+def test_dark_background():
+    style = parse_css()
+    if 'background-color' in style:
+        assert style['background-color'] == '#1a1a1a'
+"""
+
+    _UNCONDITIONAL_PRESENT = """\
+def test_dark_background():
+    style = parse_css()
+    assert 'background-color' in style, 'must be set'
+    assert style['background-color'] == '#1a1a1a'
+"""
+
+    _MIX_UNCONDITIONAL_FIRST = """\
+def test_dark_background():
+    style = parse_css()
+    assert 'background-color' in style
+    if 'color' in style:
+        assert style['color'] == '#fff'
+"""
+
+    def test_flags_guarded_only_assertions(self):
+        warnings: list[str] = []
+        _check_vacuous_assertions("tests/test_ui.py", self._GUARDED_ONLY, warnings)
+        assert len(warnings) == 1
+        assert "test_dark_background" in warnings[0]
+        assert "unconditional" in warnings[0]
+
+    def test_passes_unconditional_assertions(self):
+        warnings: list[str] = []
+        _check_vacuous_assertions("tests/test_ui.py", self._UNCONDITIONAL_PRESENT, warnings)
+        assert warnings == []
+
+    def test_passes_mixed_with_unconditional_first(self):
+        """If there's at least one unconditional assert, the function is fine."""
+        warnings: list[str] = []
+        _check_vacuous_assertions("tests/test_ui.py", self._MIX_UNCONDITIONAL_FIRST, warnings)
+        assert warnings == []
+
+    def test_skips_non_python_files(self):
+        """Non-.py files must be skipped (no crash, no spurious warnings)."""
+        warnings: list[str] = []
+        _check_vacuous_assertions("tests/test_ui.js", self._GUARDED_ONLY, warnings)
+        assert warnings == []
+
+    def test_validate_test_imports_calls_vacuous_check(self):
+        """_validate_test_imports must surface N3 warnings via _check_vacuous_assertions."""
+        ctx = _make_context(
+            all_paths=["index.html", "style.css"],
+            source_files={"style.css": "body { background: white; }"},
+        )
+        # A test file where all asserts are if-guarded
+        test_files = {"tests/test_ui.py": self._GUARDED_ONLY}
+        warnings = _validate_test_imports(test_files, ctx)
+        # Should contain at least one N3 warning
+        n3_warnings = [w for w in warnings if "unconditional" in w]
+        assert len(n3_warnings) >= 1

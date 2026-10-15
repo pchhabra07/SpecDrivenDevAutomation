@@ -197,8 +197,12 @@ def run(
                 event_type="gate1_changes_requested",
                 payload={"comments": gate_result.reviewer_comments, "cycle": cycle},
             )
+            # N5 fix: surface CI failure logs in the revision prompt so the LLM
+            # knows exactly which tests failed and why (not just reviewer text).
+            last_ci_output = getattr(gate_result, "ci_output", "") or ""
             revised_tests, revised_ci = _revise_tests(
                 llm, context, approved_tests, gate_result.reviewer_comments,
+                ci_failure_output=last_ci_output,
             )
 
             # Remove obsolete files from git branch if they were dropped during revision
@@ -250,7 +254,20 @@ def run(
             f"{_MAX_REVISION_CYCLES} revision cycles."
         )
 
-    # ── 6. Lock test files ──────────────────────────────────────────────
+    # ── 6. Pre-lock symbol validation (Issue 5 fix) ───────────────────
+    # Verify that import paths and file references in the tests actually
+    # exist in the repository before locking them permanently.
+    validation_warnings = _validate_test_imports(approved_tests, context)
+    if validation_warnings:
+        logger.warning(
+            "Pre-lock validation found %d potential issue(s) in test files:\n%s",
+            len(validation_warnings),
+            "\n".join(f"  - {w}" for w in validation_warnings),
+        )
+        # Log to audit but do NOT block — human reviewer already approved.
+        # The warnings are surfaced so the reviewer can be informed.
+
+    # ── 7. Lock test files ──────────────────────────────────────────────
     locked_hashes = build_lock_hashes(approved_tests)
     checkpoint.locked_test_hashes = locked_hashes
     checkpoint.gate1_approved = True
@@ -268,47 +285,79 @@ def run(
 # ── Project stack detection helper ─────────────────────────────────────
 
 
-def _detect_project_stack(context: TicketContext) -> str:
-    """Identify the primary technology stack of the target repository."""
-    paths = [p.lower() for p in context.all_file_paths]
+def _detect_project_stack(context: TicketContext, ticket_hint: str = "") -> str:
+    """
+    Issue 7 fix: Detect which layer of the stack is RELEVANT TO THIS TICKET,
+    not just what languages exist somewhere in the repo.
 
-    # 1. Python check
+    Polyglot repos (Django+React, FastAPI+Vue) used to always return "python"
+    because Python files were found first. Now we use the ticket text and the
+    source_files already selected for this ticket to infer the relevant layer.
+    """
+    paths = [p.lower() for p in context.all_file_paths]
+    # Combine ticket text + selected source file paths for relevance hint
+    ticket_lower = ticket_hint.lower()
+    selected = [p.lower() for p in context.source_files.keys()]
+
+    # ── Tier 1: check what the SELECTED source files actually are ────────
+    # This is the most reliable signal — Stage 1 already ranked the files
+    # most relevant to the ticket. If those files are CSS/HTML, it's a UI ticket.
+    selected_has_web   = any(p.endswith((".css", ".scss", ".html", ".htm")) for p in selected)
+    selected_has_react = any(p.endswith((".tsx", ".jsx")) or "react" in p for p in selected)
+    selected_has_js    = any(p.endswith((".ts", ".js")) for p in selected)
+    selected_has_py    = any(p.endswith(".py") for p in selected)
+    selected_has_java  = any(p.endswith(".java") for p in selected)
+    selected_has_go    = any(p.endswith(".go") for p in selected)
+    selected_has_rust  = any(p.endswith(".rs") for p in selected)
+
+    if selected_has_react:
+        return "react"
+    if selected_has_web and not selected_has_py and not selected_has_java:
+        return "static_web"
+    if selected_has_js and not selected_has_py:
+        return "node"
+    if selected_has_go:
+        return "go"
+    if selected_has_rust:
+        return "rust"
+    if selected_has_java:
+        return "java"
+    if selected_has_py:
+        return "python"
+
+    # ── Tier 2: ticket text hints (e.g. "CSS dark mode" → static_web) ──
+    frontend_keywords = ("css", "html", "style", "color", "layout", "ui ", "frontend", "dark mode", "responsive")
+    react_keywords    = ("react", "component", "tsx", "jsx", "hook", "props", "state", "render")
+    if any(k in ticket_lower for k in react_keywords):
+        return "react"
+    if any(k in ticket_lower for k in frontend_keywords):
+        # Only use static_web if no package.json exists (otherwise it's a React/Node project)
+        has_pkg_json = any(p == "package.json" or p.endswith("/package.json") for p in paths)
+        return "node" if has_pkg_json else "static_web"
+
+    # ── Tier 3: repo-wide fallback (original priority queue) ────────────
     has_python = any(
         p.endswith(".py") or p in ("pyproject.toml", "requirements.txt", "setup.py", "pipfile")
         for p in paths
     )
-    if has_python:
-        return "python"
-
-    # 2. Node / React check
     has_pkg_json = any(p == "package.json" or p.endswith("/package.json") for p in paths)
     if has_pkg_json:
-        has_react = any(
-            p.endswith((".tsx", ".jsx")) or "react" in p
-            for p in paths
-        )
+        has_react = any(p.endswith((".tsx", ".jsx")) or "react" in p for p in paths)
         return "react" if has_react else "node"
-
-    # 3. Java check
+    if has_python:
+        return "python"
     has_java = any(p in ("pom.xml", "build.gradle", "gradlew") or p.endswith(".java") for p in paths)
     if has_java:
         return "java"
-
-    # 4. Go check
     has_go = any(p in ("go.mod", "go.sum") or p.endswith(".go") for p in paths)
     if has_go:
         return "go"
-
-    # 5. Rust check
     has_rust = any(p == "cargo.toml" or p.endswith(".rs") for p in paths)
     if has_rust:
         return "rust"
-
-    # 6. Static Web check (only if no package manager or backend was found)
     has_html_css = any(p.endswith((".html", ".htm", ".css")) for p in paths)
     if has_html_css:
         return "static_web"
-
     return "generic"
 
 
@@ -324,7 +373,8 @@ def _generate_tests(
 ) -> tuple[dict[str, str], tuple[str, str] | None]:
     """Prompt the LLM to generate test cases and appropriate CI workflow from the ticket spec."""
     ticket = context.ticket
-    stack = _detect_project_stack(context)
+    ticket_hint = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
+    stack = _detect_project_stack(context, ticket_hint=ticket_hint)
 
     # Build a summary of existing tests for context.
     existing_tests_summary = ""
@@ -410,6 +460,18 @@ def _generate_tests(
             "  * NEVER write tests that only check for the presence of a class name (e.g. class='dark-mode').\n"
             "  * ALWAYS assert actual CSS properties (e.g. background-color, color, contrast) or stylesheet rules.\n"
             "  * ALWAYS assert that existing page content, sections, and structural elements remain present and intact.\n"
+            "  * MANDATORY: Every test function MUST have at least one unconditional `assert` statement.\n"
+            "    Tests that ONLY assert inside `if 'prop' in style:` guards are FORBIDDEN — they silently pass on unchanged code:\n"
+            "    # WRONG (silently passes if property absent):\n"
+            "    if 'background-color' in style: assert style['background-color'] == '#1a1a1a'\n"
+            "    # CORRECT (fails loudly if property absent):\n"
+            "    assert 'background-color' in style, 'background-color must be explicitly set'\n"
+            "    assert style['background-color'] == '#1a1a1a'\n"
+            "  * MANDATORY: Use absolute file paths for all file reads. Use:\n"
+            "    `os.path.join(os.path.dirname(__file__), '..', 'style.css')` NOT `open('style.css')`.\n"
+            "  * MANDATORY: Extract expected CSS values from the ACTUAL source files provided above.\n"
+            "    Do NOT hardcode values from memory. Check shorthand properties (e.g. `border-bottom: 1px solid #f2f2f2`)\n"
+            "    vs longhand (`border-bottom-color`) — cssutils resolves these differently.\n"
             "- STRICT PROHIBITIONS:\n"
             "  * DO NOT generate tests for `package.json`, `package-lock.json`, or node_modules.\n"
             "  * DO NOT import React, ReactDOM, or `@testing-library/react`.\n"
@@ -478,6 +540,7 @@ def _generate_tests(
         "2. REAL FUNCTIONAL ASSERTIONS (ZERO TOLERANCE FOR SUPERFICIAL TESTS):\n"
         "   - Assert exact return values, response payloads, state changes, computed styles, or DOM hierarchy.\n"
         "   - STRICTLY FORBIDDEN: Writing trivial assertions that pass without real implementation (e.g. `assert obj is not None`, `assertTrue(true)`, checking only a class name or tag without checking styles/content, or over-mocking the very unit under test).\n"
+        "   - N3 MANDATORY: Every test function MUST include at least ONE unconditional `assert` statement. Tests that ONLY assert inside `if 'prop' in style:` guards are FORBIDDEN -- they silently pass on unchanged code. WRONG: `if 'background-color' in s: assert s['background-color'] == '#111'`. CORRECT: `assert 'background-color' in s; assert s['background-color'] == '#111'`\n"
         "3. REGRESSION CHECKS: Assert that existing core components, layouts, APIs, and structures remain intact after changes are introduced.\n"
         "4. EDGE CASES & ERROR PATHS: Include tests for invalid inputs, missing data, or boundary conditions if applicable.\n"
         "5. Keep test cases minimal, focused, and free of useless boilerplate.\n"
@@ -519,31 +582,102 @@ def _revise_tests(
     context: TicketContext,
     current_tests: dict[str, str],
     reviewer_comments: list[str],
+    ci_failure_output: str = "",
 ) -> tuple[dict[str, str], tuple[str, str] | None]:
-    """Re-prompt the LLM with reviewer feedback to revise tests."""
+    """
+    N2 fix: Uses ``chat_once()`` (stateless) so each revision cycle is a clean
+    single-prompt call.  Prevents the 11K→78K token explosion seen in Issue #10
+    where 5 revision cycles accumulated ~18K tokens per cycle.
+
+    N5 fix: Includes CI failure output in the prompt so the LLM can debug
+    test failures, not just respond to reviewer text.
+
+    Also enforces N3 (unconditional assertions), N4 (CSS value extraction from
+    actual source), N6 (absolute file paths), and N8 (clear variable naming).
+    """
+    ticket = context.ticket
+    ticket_hint = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
+    stack = _detect_project_stack(context, ticket_hint=ticket_hint)
+
     comments_text = "\n".join(f"- {c}" for c in reviewer_comments)
     current_tests_text = "\n".join(
         f"### `{path}`\n```\n{content}\n```"
         for path, content in current_tests.items()
     )
+    # Include the top 10 source files so the LLM knows which paths/selectors exist
+    source_summary = ""
+    if context.source_files:
+        source_summary = (
+            "## Repository Source Files (for reference — read these to extract real CSS values)\n"
+            + "\n".join(
+                f"### `{path}`\n```\n{content}\n```"
+                for path, content in list(context.source_files.items())[:10]
+            )
+        )
+
+    # N5: CI failure section
+    ci_section = ""
+    if ci_failure_output and ci_failure_output.strip():
+        # Limit to last 60 lines to keep token cost bounded
+        failure_lines = ci_failure_output.strip().splitlines()
+        snippet = "\n".join(failure_lines[-60:])
+        ci_section = (
+            "## CI Test Failure Output (from last run)\n"
+            "The following is the actual CI failure output from running the tests above. "
+            "Use this to understand exactly which assertions failed and why:\n"
+            f"```\n{snippet}\n```\n\n"
+        )
 
     prompt = (
-        "A human reviewer has requested changes to the test cases you generated earlier.\n\n"
+        "A human reviewer has requested changes to the test cases you generated earlier.\n"
+        "You must revise the tests to address ALL reviewer feedback while staying true "
+        "to the original ticket acceptance criteria.\n\n"
+        "## Ticket\n"
+        f"**ID:** {ticket.ticket_id}\n"
+        f"**Summary:** {ticket.summary}\n"
+        f"**Acceptance Criteria:**\n{ticket.acceptance_criteria}\n\n"
         f"## Reviewer Feedback\n{comments_text}\n\n"
+        f"{ci_section}"
         f"## Current Test Files\n{current_tests_text}\n\n"
-        "## Instructions\n"
-        "1. Address ALL points raised in the reviewer's feedback.\n"
-        "2. If the reviewer requested removing any tests or test files, DO NOT include them.\n"
-        "3. Return ONLY the complete, final set of valid test files that should exist in the repository.\n"
-        "4. Do NOT generate unnecessary tests for package-lock.json or build tools unless explicitly requested.\n"
-        "5. Output format: fenced code blocks with `// FILE: path` comments.\n"
-        "6. Do not include any explanation outside of code blocks."
+        f"{source_summary}\n\n"
+        "## Stack-Specific Constraints\n"
+        f"This is a **{stack}** project. Use only file paths, selectors, function names, "
+        "and import paths that actually exist in the source files shown above.\n\n"
+        "## Mandatory Test Quality Rules (N3/N4/N6/N8 — STRICTLY ENFORCED)\n"
+        "1. **Unconditional assertions required:** Every test function MUST include at least one "
+        "unconditional `assert` statement. Tests that ONLY assert inside `if 'prop' in style:` guards "
+        "are NOT acceptable — they will silently pass on unchanged code. Rewrite conditional checks as:\n"
+        "   ```python\n"
+        "   # WRONG — silently passes if property is missing:\n"
+        "   if 'background-color' in style:\n"
+        "       assert style['background-color'] == '#1a1a1a'\n"
+        "   # CORRECT — fails loudly if property is missing:\n"
+        "   assert 'background-color' in style, 'background-color must be set'\n"
+        "   assert style['background-color'] == '#1a1a1a'\n"
+        "   ```\n"
+        "2. **Extract CSS values from actual source files:** Do NOT hardcode expected CSS values from "
+        "memory. Read the actual source CSS files shown above and use the exact property values that "
+        "appear in those files. For CSS shorthand properties like `border-bottom: 1px solid #f2f2f2`, "
+        "use the shorthand value string, not the longhand `border-bottom-color`.\n"
+        "3. **Absolute file paths for file reads:** Use `os.path.join(os.path.dirname(__file__), "
+        "'..', 'style.css')` or `os.path.abspath(...)` instead of `open('style.css')`. Relative paths "
+        "break when pytest is run from a directory other than the repo root.\n"
+        "4. **Clear, distinct variable names:** Use `original_sheets` for baseline snapshots and "
+        "`current_sheets` for post-change state. Never use the same variable for both roles.\n"
+        "5. Address ALL points raised in the reviewer's feedback.\n"
+        "6. If the reviewer requested removing any tests or test files, DO NOT include them.\n"
+        "7. Return ONLY the complete, final set of valid test files.\n"
+        "8. Do NOT generate unnecessary tests for package-lock.json or build tools.\n"
+        "9. Output format: fenced code blocks with `// FILE: path` comments.\n"
+        "10. Do not include any explanation outside of code blocks."
     )
 
-    response = llm.chat(
+    # N2 fix: use chat_once() to prevent cross-cycle token accumulation.
+    # Each revision cycle gets a clean context = system prompt + this single prompt.
+    response = llm.chat_once(
         prompt,
         stage=2,
-        call_purpose="Revise tests per Gate 1 reviewer feedback",
+        call_purpose="Revise tests per Gate 1 reviewer feedback (stateless)",
         attached_files=list(current_tests.keys()),
     )
     content = response.get("content", "")
@@ -564,6 +698,131 @@ def _revise_tests(
             test_files[norm] = file_content
 
     return test_files if test_files else current_tests, ci_workflow
+
+def _validate_test_imports(
+    test_files: dict[str, str],
+    context: TicketContext,
+) -> list[str]:
+    """
+    Issue 5 fix: Scan generated test files for import paths and file references
+    that don't exist in the repository, flagging them before locking.
+
+    Returns a list of warning strings (empty = all clear).
+    """
+    import re as _re
+    warnings: list[str] = []
+    all_paths_lower = {p.lower() for p in context.all_file_paths}
+    all_basenames = {p.rsplit("/", 1)[-1].lower() for p in context.all_file_paths}
+
+    # Patterns that reference repository files
+    _q = r"[^'\"]"
+    import_patterns = [
+        # Python: from some.module import X  /  import some.module
+        _re.compile(r"^(?:from|import)\s+([\w.]+)", _re.MULTILINE),
+        # JS/TS relative import paths - match both quote styles via two alternates
+        _re.compile(r"(?:from|require)\s*'(\./[^']+|\.\.?/[^']+)'", _re.MULTILINE),
+        # Python open() file path references
+        _re.compile(r"open\('((?!http)[^']+\.(?:html|css|js|ts|py))'\)", _re.MULTILINE),
+    ]
+
+    for test_path, content in test_files.items():
+        for pat in import_patterns:
+            for m in pat.finditer(content):
+                ref = m.group(1).strip()
+                # Only check relative file references (starting with . or /)
+                if ref.startswith(("./")):
+                    basename = ref.rsplit("/", 1)[-1].lower()
+                    # Strip extension aliases
+                    for ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".html"):
+                        basename = basename.replace(ext, "")
+                    if basename and not any(basename in p for p in all_paths_lower):
+                        warnings.append(
+                            f"`{test_path}` references `{ref}` which was not found in the repository file tree."
+                        )
+                elif ref.endswith((".html", ".css")):
+                    # Direct file path references (e.g. open("index.html"))
+                    basename = ref.rsplit("/", 1)[-1].lower()
+                    if basename not in all_basenames:
+                        warnings.append(
+                            f"`{test_path}` opens `{ref}` which was not found in the repository."
+                        )
+
+        # N3 check: detect test functions whose ONLY asserts are inside if-guards.
+        # These silently pass on unchanged code, providing no real test gate.
+        _check_vacuous_assertions(test_path, content, warnings)
+
+    return warnings
+
+
+def _check_vacuous_assertions(
+    test_path: str,
+    content: str,
+    warnings: list[str],
+) -> None:
+    """
+    N3 fix: Scan a Python test file for test functions that have no unconditional
+    assert at the top-level function body — i.e., all asserts are inside `if` blocks.
+    These tests silently pass on unchanged code (they skip the assertion if the
+    CSS property is absent, which is exactly what happens before dark-mode is applied).
+
+    Appends warning strings to `warnings` for each offending function.
+    """
+    import re as _re
+
+    # Only analyse Python test files (simple heuristic)
+    if not test_path.endswith(".py"):
+        return
+
+    # Find all def test_*(self) or def test_*() functions
+    fn_starts = [m.start() for m in _re.finditer(r"^def test_", content, _re.MULTILINE)]
+    if not fn_starts:
+        return
+
+    for i, start in enumerate(fn_starts):
+        end = fn_starts[i + 1] if i + 1 < len(fn_starts) else len(content)
+        fn_body = content[start:end]
+
+        # Extract function name
+        fn_name_match = _re.match(r"def (test_\w+)", fn_body)
+        fn_name = fn_name_match.group(1) if fn_name_match else "unknown"
+
+        lines_in_fn = fn_body.splitlines()
+
+        has_any_assert = any("assert" in line for line in lines_in_fn)
+        if not has_any_assert:
+            continue  # No asserts at all — different problem, not flagged here
+
+        # Check if there is at least one unconditional assert (not indented inside an if)
+        # An unconditional assert at function level has 4-space indent (or 1 tab) relative
+        # to the def keyword, and is NOT preceded by an if-line at the same indent.
+        has_unconditional = False
+        prev_is_if = False
+        fn_indent = len(lines_in_fn[0]) - len(lines_in_fn[0].lstrip()) if lines_in_fn else 0
+        body_indent = fn_indent + 4  # one level deeper than def
+
+        for line in lines_in_fn[1:]:
+            stripped_line = line.lstrip()
+            if not stripped_line:
+                continue
+            curr_indent = len(line) - len(stripped_line)
+            if curr_indent == body_indent:
+                if stripped_line.startswith("if ") or stripped_line.startswith("if("):
+                    prev_is_if = True
+                elif stripped_line.startswith("assert ") or stripped_line.startswith("assert("):
+                    if not prev_is_if:
+                        has_unconditional = True
+                        break
+                    prev_is_if = False  # Reset; next assert at this level is unconditional
+                else:
+                    prev_is_if = False
+
+        if not has_unconditional:
+            warnings.append(
+                f"`{test_path}` — `{fn_name}()` has no unconditional top-level assert. "
+                "All assertions appear to be inside `if` guards, which means the test "
+                "silently passes if the expected CSS properties are absent. "
+                "Add an unconditional `assert 'property' in style` before each guarded check."
+            )
 
 
 def _parse_test_files(llm_output: str) -> dict[str, str]:

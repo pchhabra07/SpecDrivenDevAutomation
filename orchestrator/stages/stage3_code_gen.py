@@ -21,13 +21,16 @@ from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
+from orchestrator.ci_log_parser import format_errors_for_prompt, parse_ci_log
 from orchestrator.ci_poller import CIResult, trigger_ci, wait_for_pipeline
+from orchestrator.diff_patcher import apply_patches_to_sources, parse_llm_response
 from orchestrator.llm_client import LLMClient
 from orchestrator.notifier import (
     build_escalation_message,
     notify_email,
     notify_slack,
 )
+from orchestrator.preflight_checker import build_repair_prompt, check_all
 from orchestrator.stages.stage1_context import TicketContext
 from orchestrator.tamper_check import check_tampering
 
@@ -130,6 +133,21 @@ def run(
 
         # ── 1. Prompt the LLM ────────────────────────────────────────
         active_reviewer_feedback = reviewer_feedback or getattr(checkpoint, "reviewer_feedback", [])
+
+        # N1 fix: Reset LLM history before every coding iteration so the model
+        # cannot use stale in-context memory of files modified by prior iterations.
+        # Each iteration's prompt already injects the CURRENT file content via
+        # `current_sources` (re-fetched from Git HEAD after the previous commit).
+        # If history is kept, the model hallucinates SEARCH blocks that matched
+        # the file on iteration 1 but no longer exist after iteration 2+ patched it.
+        if iteration > 1:
+            logger.info(
+                "Clearing LLM history before iteration %d to prevent SEARCH text drift "
+                "(stale in-context memory of prior file content).",
+                iteration,
+            )
+            llm.clear_history(keep_system=True)
+
         logger.info("LLM call: generating code changes…")
         t0 = _time.monotonic()
         generated_files = _generate_code(
@@ -153,7 +171,38 @@ def run(
             )
             continue
 
-        # ── 2. Commit changes ────────────────────────────────────────
+        # ── 2. Pre-flight syntax verification (Phase 3) ─────────────
+        logger.info("Running local pre-flight syntax verification…")
+        preflight_passed, preflight_results = check_all(generated_files)
+        if not preflight_passed:
+            failed_paths = [r.path for r in preflight_results if not r.passed]
+            logger.warning(
+                "Pre-flight FAILED for %d file(s): %s — skipping remote commit, re-prompting LLM.",
+                len(failed_paths), failed_paths,
+            )
+            audit.log(
+                stage=3,
+                event_type="preflight_failed",
+                payload={"iteration": iteration, "failed_files": failed_paths},
+            )
+            repair_prompt = build_repair_prompt(preflight_results)
+            response = llm.chat(
+                repair_prompt,
+                stage=3,
+                call_purpose=f"Syntax repair for iteration {iteration}",
+                attached_files=list(generated_files.keys()),
+            )
+            repair_content = response.get("content", "")
+            repaired_parsed = parse_llm_response(repair_content)
+            repaired_files, _, _ = apply_patches_to_sources(repaired_parsed, current_sources)
+            if repaired_files:
+                generated_files = repaired_files
+                logger.info("Repair produced %d file(s); proceeding with commit.", len(generated_files))
+            else:
+                logger.warning("LLM repair returned no files; skipping iteration %d.", iteration)
+                continue
+
+        # ── 3. Commit changes ────────────────────────────────────────
         logger.info("Committing %d file(s) to branch %s", len(generated_files), code_branch)
         commit_sha = gitlab.commit_files(
             branch=code_branch,
@@ -166,8 +215,16 @@ def run(
         )
         logger.info("Commit successful")
 
-        # Update current source snapshot.
-        current_sources.update(generated_files)
+        # ── 4. Re-fetch modified files from Git HEAD (Fix Issue 1) ───
+        # Ensures current_sources always reflects what is actually on
+        # the branch, not a potentially stale in-memory dict.
+        for path in generated_files:
+            try:
+                fresh = gitlab.get_file_content(path, ref=code_branch)
+                current_sources[path] = fresh
+            except Exception:
+                # File too new to show yet; keep local patched content.
+                current_sources[path] = generated_files[path]
         checkpoint.modified_files = list(
             set(checkpoint.modified_files) | set(generated_files.keys())
         )
@@ -343,27 +400,34 @@ def _generate_code(
         )
 
     task_desc = (
-        "Your PRIMARY task is to address all points raised in the Human Approver's review feedback, "
-        "while ensuring all locked tests pass without regressions."
+        "Your PRIMARY task is to address ALL points raised in the Human Approver's review feedback. "
+        "Satisfying these reviewer comments is GOAL 1. Maintaining locked test pass status is GOAL 2 (secondary)."
         if reviewer_feedback
-        else "Your task is to implement clean, targeted code changes that satisfy the ticket's acceptance criteria "
-        "and make the locked test suite pass."
+        else "Your task is to implement clean, targeted, surgical code changes that satisfy the ticket's "
+        "acceptance criteria and make the locked test suite pass."
     )
 
-    # Previous iteration context.
+    # Issue 2 fix: structured error extraction replaces raw log dump.
+    # The LLM now receives precise file:line:message diagnostics instead
+    # of a 100-line CI blob it has to mentally parse.
     iteration_context = ""
     if last_test_output and iteration > 1:
-        test_lines = last_test_output.strip().splitlines()
-        if len(test_lines) > 100:
-            truncated_output = "\n".join(test_lines[:100]) + "\n... [truncated for token brevity]"
+        parsed_errors = parse_ci_log(last_test_output)
+        if parsed_errors:
+            structured = format_errors_for_prompt(parsed_errors)
+            iteration_context = (
+                f"{structured}\n\n"
+                f"Address EVERY error listed above. Do not make changes to unrelated code.\n\n"
+            )
         else:
-            truncated_output = last_test_output.strip()
-        iteration_context = (
-            f"## Previous Iteration Test Results\n"
-            f"```\n{truncated_output}\n```\n\n"
-            f"The above tests failed in the previous iteration. "
-            f"Analyse the failures and try a different approach.\n\n"
-        )
+            # Fallback: short raw tail if parser found nothing actionable
+            test_lines = last_test_output.strip().splitlines()
+            tail = "\n".join(test_lines[-40:])
+            iteration_context = (
+                f"## Previous Iteration Failure (raw tail)\n"
+                f"```\n{tail}\n```\n\n"
+                f"Analyse the failure and fix the root cause.\n\n"
+            )
 
     has_react = any("react" in p.lower() or p.endswith((".tsx", ".jsx")) for p in context.all_file_paths)
     react_hint = (
@@ -374,7 +438,7 @@ def _generate_code(
     )
 
     prompt = (
-        "You are a senior software engineer. "
+        "You are a senior software engineer acting as a surgical AI coding agent. "
         f"{task_desc}\n\n"
         "## Ticket\n"
         f"**ID:** {ticket.ticket_id}\n"
@@ -386,21 +450,38 @@ def _generate_code(
         f"## Current Source Files\n{source_summary}\n\n"
         f"{locked_tests_summary}\n\n"
         "## Critical Rules\n"
-        "1. TARGETED & SURGICAL EDITS: Identify the exact lines, rules, or functions that require changes. "
-        "Do NOT rewrite entire files or recreate layouts from scratch unless strictly required. Keep the blast radius minimal.\n"
-        "2. PRESERVE EXISTING ARCHITECTURE & STYLING: You MUST preserve all existing layout structures (e.g. flex/grid splits, column widths, fixed sizes, sticky positioning, responsive breakpoints) and unrelated components. Do NOT remove, rename, or disturb working layout properties.\n"
-        "3. IMMUTABLE FILES: You MUST NOT modify any locked test files or CI workflow files. They are immutable.\n"
-        "4. SATISFY HUMAN FEEDBACK & SPEC: Satisfy all human reviewer comments and acceptance criteria, while ensuring all locked tests pass.\n"
-        "5. ONLY EMIT MODIFIED FILES: Only return files that actually require changes. Do not re-emit files that are unchanged.\n"
+        "1. SURGICAL EDITS ONLY: Identify the exact lines, rules, or functions that need changing. "
+        "DO NOT rewrite entire files. DO NOT regenerate unchanged code. Keep the blast radius minimal.\n"
+        "2. PRESERVE EXISTING ARCHITECTURE: You MUST preserve ALL existing layout structures "
+        "(flex/grid splits, column widths, fixed sizes, sticky positioning, responsive breakpoints) "
+        "and all unrelated components. Do NOT remove or alter working properties.\n"
+        "3. IMMUTABLE FILES: You MUST NOT modify any locked test files or CI workflow files.\n"
+        "4. PRIMARY OBJECTIVE: Satisfy ALL human reviewer comments and acceptance criteria first. "
+        "Locked tests passing is secondary.\n"
+        "5. ONLY EMIT CHANGED FILES: Only include files that actually need modifications.\n"
         f"{react_hint}\n"
-        "## Output Format\n"
-        "Return your answer as one or more fenced code blocks, each preceded by "
-        "a single-line file path comment like:\n"
+        "## Mandatory Two-Stage Response Format\n"
+        "Your response MUST have exactly two sections:\n\n"
+        "### 1. ARCHITECTURAL PLAN & IMPACT ANALYSIS\n"
+        "Before writing any code, write your plan here. Include:\n"
+        "- **Identified Change Locations:** Which file(s) and which specific lines/selectors/functions to edit\n"
+        "- **Preservation Verification:** Explicit confirmation that flex/grid layouts, sticky positioning, "
+        "column widths, and all unrelated DOM/CSS sections are left untouched\n"
+        "- **Reviewer Feedback Addressed:** List each reviewer comment and how you will address it\n\n"
+        "### 2. CODE EDITS\n"
+        "After the plan, emit ONLY the changed code sections using SEARCH/REPLACE blocks:\n"
         "```\n"
         "// FILE: path/to/file.ext\n"
+        "<<<<<<< SEARCH\n"
+        "[exact original lines to find -- must be unique in the file]\n"
+        "=======\n"
+        "[replacement lines]\n"
+        ">>>>>>> REPLACE\n"
         "```\n"
-        "followed by the complete file content.\n"
-        "Do not include any explanation outside of code blocks."
+        "- Each SEARCH block must match EXACTLY what is in the file (whitespace included).\n"
+        "- For BRAND NEW files only, use: `// FILE: path` followed by the complete content "
+        "(no SEARCH/REPLACE needed).\n"
+        "- Do NOT output whole-file rewrites for existing files -- use SEARCH/REPLACE blocks only."
     )
 
     for attempt in range(1, _MAX_LOCKED_REJECTIONS + 1):
@@ -410,8 +491,79 @@ def _generate_code(
             call_purpose=f"Code generation iteration {iteration} (attempt {attempt})",
             attached_files=list(current_sources.keys()),
         )
-        content = response.get("content", "")
-        files = _parse_generated_files(content)
+        raw_content = response.get("content", "")
+
+        # ── Parse using the surgical diff patcher (Phase 1) ──────────
+        parsed_patches = parse_llm_response(raw_content)
+        if not parsed_patches:
+            # Fallback: legacy full-file parser as last resort.
+            # Issue 3 fix: warn visibly + re-prompt for format compliance.
+            logger.warning(
+                "LLM response for iteration %d contained no SEARCH/REPLACE blocks. "
+                "Falling back to legacy full-file parser and re-prompting for format "
+                "compliance on next attempt.",
+                iteration,
+            )
+            audit.log(
+                stage=3,
+                event_type="format_noncompliant",
+                payload={"iteration": iteration, "attempt": attempt},
+            )
+            files = _parse_generated_files(raw_content)
+            # Re-prompt for format compliance on next attempt
+            if attempt < _MAX_LOCKED_REJECTIONS:
+                prompt = (
+                    "Your previous response did not use the required SEARCH/REPLACE block format. "
+                    "You MUST respond using SEARCH/REPLACE blocks only for existing files. "
+                    "Do NOT output full file rewrites. Here is the required format:\n\n"
+                    "// FILE: path/to/file.ext\n"
+                    f"{chr(60)*7} SEARCH\n"
+                    "[exact original lines to find]\n"
+                    "=======\n"
+                    "[replacement lines]\n"
+                    f"{chr(62)*7} REPLACE\n\n"
+                    "Resend your changes in this format now."
+                )
+                continue
+        else:
+            # Issue 4 fix: Extract and log the architectural plan before code edits.
+            plan_section = _extract_plan_section(raw_content)
+            if plan_section:
+                logger.info(
+                    "[Plan] Iteration %d architectural plan logged (%d chars): %.300s",
+                    iteration, len(plan_section), plan_section,
+                )
+
+            # Issue 11 fix: all-or-nothing commit gate.
+            files, patch_results, all_succeeded = apply_patches_to_sources(
+                parsed_patches, current_sources
+            )
+            failed_patches = [pr for pr in patch_results if not pr.success]
+            for pr in failed_patches:
+                logger.warning("Patch failed for %s: %s", pr.path, pr.errors)
+
+            if not all_succeeded and attempt < _MAX_LOCKED_REJECTIONS:
+                # Build a targeted re-prompt from the failed patches.
+                fail_details = "\n".join(
+                    f"- FILE `{pr.path}`: {'; '.join(pr.errors[:2])}"
+                    for pr in failed_patches
+                )
+                logger.warning(
+                    "All-or-nothing gate: %d patch(es) failed — aborting commit, "
+                    "re-prompting LLM (attempt %d/%d).\n%s",
+                    len(failed_patches), attempt, _MAX_LOCKED_REJECTIONS, fail_details,
+                )
+                prompt = (
+                    f"Your SEARCH/REPLACE blocks contained {len(failed_patches)} "
+                    f"failure(s) that could not be applied:\n\n{fail_details}\n\n"
+                    "These failures are likely because the SEARCH text does not exactly "
+                    "match the current file content (whitespace, surrounding context, "
+                    "or already-applied changes). Please:\n"
+                    "1. Include MORE surrounding lines in your SEARCH block to make it unique.\n"
+                    "2. Make sure the SEARCH text exactly matches the current file content.\n"
+                    "3. Resubmit ONLY the failed patches in corrected SEARCH/REPLACE format."
+                )
+                continue
 
         # Check for locked/blocked file violations.
         violations = set(files.keys()) & effective_blocked
@@ -430,7 +582,7 @@ def _generate_code(
             prompt = (
                 f"Your previous response included modifications to immutable files "
                 f"({', '.join(violations)}). These files must not be changed. "
-                f"Please regenerate your code changes WITHOUT modifying "
+                f"Please regenerate your SEARCH/REPLACE code changes WITHOUT modifying "
                 f"any of these files. Only create or update implementation source files."
             )
 
@@ -465,6 +617,8 @@ def _parse_generated_files(llm_output: str) -> dict[str, str]:
         for prefix in prefixes:
             if stripped.lower().startswith(prefix.lower()):
                 raw = stripped[len(prefix):].removesuffix("*/").strip().strip("`'\"")
+                # Issue 10 fix: terminate at first whitespace
+                raw = raw.split()[0] if raw.split() else raw
                 if raw:
                     is_marker = True
                     target_path = raw.replace("\\", "/")
@@ -493,6 +647,30 @@ def _parse_generated_files(llm_output: str) -> dict[str, str]:
         files[current_path] = "\n".join(current_content).strip()
 
     return files
+
+
+def _extract_plan_section(raw_response: str) -> str:
+    """
+    Issue 4 fix: Extract the ARCHITECTURAL PLAN section from the LLM's
+    two-stage response so it can be logged to audit.
+
+    Looks for text between the plan header and the CODE EDITS header.
+    Returns an empty string if the section is not found.
+    """
+    import re as _re
+    plan_start = _re.search(
+        r"###?\s*1\.?\s*ARCHITECTURAL PLAN",
+        raw_response, _re.IGNORECASE,
+    )
+    code_start = _re.search(
+        r"###?\s*2\.?\s*CODE EDITS",
+        raw_response, _re.IGNORECASE,
+    )
+    if plan_start:
+        start_idx = plan_start.end()
+        end_idx = code_start.start() if code_start else len(raw_response)
+        return raw_response[start_idx:end_idx].strip()
+    return ""
 
 
 def _fetch_locked_test_contents(

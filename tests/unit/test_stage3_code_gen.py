@@ -378,3 +378,116 @@ class TestStage3Run:
         # Escalation calls.
         gitlab.add_mr_label.assert_called_once()
         jira.post_comment.assert_called_once()
+
+
+# ── N1 Fix: History cleared before each iteration > 1 ─────────────────
+
+
+class TestN1HistoryClear:
+    """N1 fix: LLM history must be reset before every iteration after the first.
+
+    Without this, the model uses its in-context memory of the original file
+    content to write SEARCH blocks — even though prior iterations already
+    patched those exact lines.  The result is cascading PATCH NOT FOUND errors.
+    """
+
+    @patch("orchestrator.stages.stage3_code_gen.wait_for_pipeline")
+    @patch("orchestrator.stages.stage3_code_gen.trigger_ci")
+    def test_clear_history_called_on_iteration_2_and_beyond(
+        self, mock_trigger, mock_wait,
+    ):
+        """clear_history(keep_system=True) must be called at iteration 2+."""
+        gitlab = MagicMock()
+        gitlab.branch_exists.return_value = True
+        gitlab.create_mr.return_value = MergeRequestInfo(
+            iid=99, web_url="", state="opened", draft=True,
+        )
+        gitlab.commit_files.return_value = "sha_n1"
+        gitlab.get_file_content.return_value = "test('renders', () => {});"
+
+        llm = MagicMock()
+        # Iteration 1: returns code change; Iteration 2: passes tests
+        llm.chat.side_effect = [
+            {"content": "// FILE: src/widget.ts\n```typescript\nv1\n```\n"},
+            {"content": "// FILE: src/widget.ts\n```typescript\nv2\n```\n"},
+        ]
+
+        jira = MagicMock()
+        audit = MagicMock(spec=AuditLogger)
+        checkpoint = _make_checkpoint()
+        from orchestrator.tamper_check import hash_content
+        checkpoint.locked_test_hashes = {
+            "src/__tests__/widget.test.ts": hash_content("test('renders', () => {});"),
+        }
+
+        mock_trigger.return_value = 500
+        mock_wait.side_effect = [
+            CIResult(
+                pipeline_id=500, status="failed", web_url="",
+                jobs=[{"name": "test", "status": "failed"}],
+            ),
+            CIResult(
+                pipeline_id=501, status="success", web_url="",
+                jobs=[{"name": "test", "status": "success"}],
+            ),
+        ]
+
+        run(
+            context=_make_context(),
+            gitlab=gitlab,
+            llm=llm,
+            jira=jira,
+            checkpoint=checkpoint,
+            audit=audit,
+            max_iterations=6,
+            ci_poll_interval=1,
+            ci_timeout_minutes=1,
+        )
+
+        # Iteration 1: no history clear needed.  Iteration 2: must clear.
+        llm.clear_history.assert_called_once_with(keep_system=True)
+
+    @patch("orchestrator.stages.stage3_code_gen.wait_for_pipeline")
+    @patch("orchestrator.stages.stage3_code_gen.trigger_ci")
+    def test_no_history_clear_on_iteration_1(self, mock_trigger, mock_wait):
+        """clear_history must NOT be called when only one iteration runs."""
+        gitlab = MagicMock()
+        gitlab.branch_exists.return_value = True
+        gitlab.create_mr.return_value = MergeRequestInfo(
+            iid=98, web_url="", state="opened", draft=True,
+        )
+        gitlab.commit_files.return_value = "sha_n1b"
+        gitlab.get_file_content.return_value = "test('renders', () => {});"
+
+        llm = MagicMock()
+        llm.chat.return_value = {
+            "content": "// FILE: src/widget.ts\n```typescript\nv1\n```\n"
+        }
+
+        jira = MagicMock()
+        audit = MagicMock(spec=AuditLogger)
+        checkpoint = _make_checkpoint()
+        from orchestrator.tamper_check import hash_content
+        checkpoint.locked_test_hashes = {
+            "src/__tests__/widget.test.ts": hash_content("test('renders', () => {});"),
+        }
+
+        mock_trigger.return_value = 600
+        mock_wait.return_value = CIResult(
+            pipeline_id=600, status="success", web_url="",
+            jobs=[{"name": "test", "status": "success"}],
+        )
+
+        run(
+            context=_make_context(),
+            gitlab=gitlab,
+            llm=llm,
+            jira=jira,
+            checkpoint=checkpoint,
+            audit=audit,
+            max_iterations=6,
+            ci_poll_interval=1,
+            ci_timeout_minutes=1,
+        )
+
+        llm.clear_history.assert_not_called()

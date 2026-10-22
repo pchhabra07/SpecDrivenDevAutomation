@@ -16,6 +16,7 @@ Implements FR-9, FR-10, FR-11.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import time as _time
 from typing import Any
 
@@ -54,6 +55,7 @@ def run(
     slack_webhook_url: str = "",
     escalation_email: str = "",
     reviewer_feedback: list[str] | None = None,
+    reuse_stage3_final_pipeline: bool = True,
 ) -> dict[str, Any]:
     """
     Execute Stage 3: iterative code generation with tamper-checking.
@@ -150,6 +152,7 @@ def run(
 
         logger.info("LLM call: generating code changes…")
         t0 = _time.monotonic()
+        reviewer_history = getattr(checkpoint, "reviewer_feedback_history", [])
         generated_files = _generate_code(
             llm=llm,
             context=context,
@@ -157,7 +160,9 @@ def run(
             last_test_output=last_test_output,
             iteration=iteration,
             blocked_paths=blocked_paths,
+            locked_paths=locked_paths,
             reviewer_feedback=active_reviewer_feedback,
+            reviewer_feedback_history=reviewer_history,
         )
         elapsed = _time.monotonic() - t0
         logger.info("LLM responded in %.1fs with %d file(s)", elapsed, len(generated_files) if generated_files else 0)
@@ -238,7 +243,7 @@ def run(
             commit_sha=commit_sha,
         )
         checkpoint.ci_pipeline_id = pipeline_id
-        checkpoint.save(checkpoint_dir=_infer_checkpoint_dir(checkpoint))
+        checkpoint.save()
 
         ci_result: CIResult = wait_for_pipeline(
             gitlab, pipeline_id,
@@ -294,13 +299,41 @@ def run(
                 "test_results": test_results,
             },
         )
-        checkpoint.save(checkpoint_dir=_infer_checkpoint_dir(checkpoint))
+        checkpoint.save()
 
         # ── 6. Check if all tests pass ─────────────────────────────────
         if ci_result.passed and test_results.get("failed", 0) == 0:
             logger.info(
                 "✓ All target tests pass after iteration %d", iteration,
             )
+            # S4-3: Trigger full CI pipeline on final passing commit for Stage 4 reuse
+            if reuse_stage3_final_pipeline:
+                try:
+                    logger.info("Triggering full CI pipeline on passing commit for Stage 4 reuse…")
+                    full_pipeline_id = trigger_ci(
+                        gitlab,
+                        code_branch,
+                        variables={},  # No TEST_ONLY = full CI pipeline
+                        commit_sha=commit_sha,
+                    )
+                    full_ci_result = wait_for_pipeline(
+                        gitlab,
+                        full_pipeline_id,
+                        poll_interval_seconds=ci_poll_interval,
+                        timeout_minutes=ci_timeout_minutes,
+                    )
+                    checkpoint.ci_pipeline_id = full_pipeline_id
+                    checkpoint.stage3_final_pipeline_result = {
+                        "pipeline_id": full_pipeline_id,
+                        "status": full_ci_result.status,
+                        "web_url": full_ci_result.web_url,
+                        "jobs": full_ci_result.jobs,
+                    }
+                    checkpoint.save()
+                    logger.info("Full CI pipeline %d completed (status=%s) and cached for Stage 4", full_pipeline_id, full_ci_result.status)
+                except Exception as exc:
+                    logger.warning("Could not execute full CI pipeline in Stage 3: %s", exc)
+
             audit.log(
                 stage=3,
                 event_type="stage3_complete",
@@ -355,6 +388,96 @@ def _lang_for_path(path: str) -> str:
     }.get(ext, "")
 
 
+def _extract_failing_file_paths(
+    last_test_output: str,
+    current_sources: dict[str, str],
+) -> list[str]:
+    """
+    Parse test failure output to extract file paths mentioned in stack traces / CI errors.
+    Returns those paths that also exist in current_sources.
+    """
+    if not last_test_output:
+        return []
+    mentioned: set[str] = set()
+
+    # Also parse structured errors if possible
+    try:
+        parsed_errors = parse_ci_log(last_test_output)
+        for err in parsed_errors:
+            if err.file:
+                for path in current_sources:
+                    norm = path.replace("\\", "/")
+                    err_norm = err.file.replace("\\", "/")
+                    if norm.endswith(err_norm) or err_norm.endswith(norm):
+                        mentioned.add(path)
+    except Exception as exc:
+        logger.debug("Failed parsing structured errors for failing files: %s", exc)
+
+    for line in last_test_output.splitlines():
+        for path in current_sources:
+            norm_path = path.replace("\\", "/")
+            base_name = Path(norm_path).name
+            if norm_path in line or (base_name and len(base_name) > 3 and base_name in line):
+                mentioned.add(path)
+
+    return list(mentioned)
+
+
+def _build_patch_failure_prompt(
+    patch_failures: list[str],
+    failed_file_paths: list[str],
+    current_sources: dict[str, str],
+) -> str:
+    """
+    Build immediate repair prompt with exact current file content for failed patches.
+    """
+    failure_list = "\n".join(f"- {f}" for f in patch_failures)
+    files_section_parts = []
+    for path in failed_file_paths:
+        content = current_sources.get(path, "")
+        if content:
+            files_section_parts.append(
+                f"### `{path}`\n```{_lang_for_path(path)}\n{content}\n```"
+            )
+    files_section = "\n\n".join(files_section_parts)
+    return (
+        f"Your SEARCH/REPLACE blocks contained {len(patch_failures)} failure(s) that could not be applied:\n\n"
+        f"{failure_list}\n\n"
+        "## Exact Current File Contents (use EXACTLY this text in your SEARCH blocks)\n"
+        f"{files_section}\n\n"
+        "These failures occurred because the SEARCH text does not match the current file content.\n"
+        "Please:\n"
+        "1. Use the EXACT current file content shown above for your SEARCH blocks (whitespace and lines included).\n"
+        "2. Include 2-3 lines of surrounding context in the SEARCH block to make it unique.\n"
+        "3. Resubmit ONLY the failed patches in corrected SEARCH/REPLACE format."
+    )
+
+
+def _format_reviewer_feedback(
+    reviewer_feedback: list[str],
+    history: list[list[str]] | None = None,
+) -> str:
+    """Format latest reviewer feedback with a concise summary of previous review rounds."""
+    if not reviewer_feedback:
+        return ""
+    current = "\n".join(f"- {c}" for c in reviewer_feedback)
+    history_note = ""
+    prev_cycles = [h for h in (history or []) if h != reviewer_feedback]
+    if prev_cycles:
+        last_prev = prev_cycles[-1]
+        summary = ", ".join(last_prev[:2])
+        history_note = (
+            f"\n\n**Note:** {len(prev_cycles)} previous review cycle(s) also requested changes. "
+            f"Ensure those concerns (previous highlights: {summary}) remain addressed."
+        )
+    return (
+        "## 🚨 PRIMARY OBJECTIVE: Human Approver Review Feedback\n"
+        "A human reviewer has reviewed the previous Pull Request and explicitly requested the following improvements.\n"
+        "Satisfying ALL points below is your PRIMARY target. Making tests pass is secondary:\n"
+        f"{current}{history_note}\n\n"
+    )
+
+
 def _generate_code(
     llm: LLMClient,
     context: TicketContext,
@@ -364,6 +487,7 @@ def _generate_code(
     blocked_paths: set[str] | None = None,
     locked_paths: set[str] | None = None,
     reviewer_feedback: list[str] | None = None,
+    reviewer_feedback_history: list[list[str]] | None = None,
 ) -> dict[str, str]:
     """
     Prompt the LLM to generate code changes and parse the response.
@@ -374,11 +498,85 @@ def _generate_code(
     effective_blocked = set(blocked_paths or ()) | set(locked_paths or ())
     ticket = context.ticket
 
-    # Build source context.
-    source_summary = "\n".join(
-        f"### `{path}`\n```{_lang_for_path(path)}\n{content}\n```"
-        for path, content in list(current_sources.items())[:15]
-    )
+    # S3-4: Use current_sources for content and strictly exclude blocked/locked paths
+    source_section_files = {
+        path: content
+        for path, content in current_sources.items()
+        if path not in effective_blocked
+    }
+
+    # S3-3: Identify failing test referenced files if test failures occurred
+    failing_related_paths: list[str] = []
+    if last_test_output and iteration > 1:
+        failing_related_paths = _extract_failing_file_paths(last_test_output, source_section_files)
+
+    seen: set[str] = set()
+    priority_paths: list[str] = []
+
+    # Priority 1: Failing-test referenced files (if any)
+    for p in failing_related_paths:
+        if p in source_section_files and p not in seen:
+            priority_paths.append(p)
+            seen.add(p)
+
+    # Priority 2: LLM-selected paths from stage 1
+    for p in (getattr(context, "llm_selected_paths", None) or []):
+        if p in source_section_files and p not in seen:
+            priority_paths.append(p)
+            seen.add(p)
+
+    # Priority 3: Remaining source files
+    for p in source_section_files:
+        if p not in seen:
+            priority_paths.append(p)
+            seen.add(p)
+
+    # S3-3 Tiered source inclusion:
+    # If iteration == 1 or no failing files identified, provide full content for priority files.
+    source_section_parts = []
+    tier1_paths = failing_related_paths[:5] if failing_related_paths else priority_paths[:10]
+    tier2_paths = [p for p in priority_paths if p not in tier1_paths][:10]
+
+    for path in tier1_paths:
+        content = source_section_files[path]
+        label = " (FAILING TEST REFERENCES THIS FILE — full content)" if path in failing_related_paths else ""
+        source_section_parts.append(
+            f"### `{path}`{label}\n```{_lang_for_path(path)}\n{content}\n```"
+        )
+
+    for path in tier2_paths:
+        content = source_section_files[path]
+        lines = content.splitlines()
+        # Preview long files (> 60 lines) on later iterations or when failing files exist
+        if len(lines) > 60 and (iteration > 1 or failing_related_paths):
+            preview = "\n".join(lines[:50])
+            note = f"\n... ({len(lines) - 50} more lines omitted for context brevity)"
+            source_section_parts.append(
+                f"### `{path}` (preview — request full content if needed)\n```{_lang_for_path(path)}\n{preview}{note}\n```"
+            )
+        else:
+            source_section_parts.append(
+                f"### `{path}`\n```{_lang_for_path(path)}\n{content}\n```"
+            )
+
+    source_summary = "\n\n".join(source_section_parts)
+
+    # Token budget check & reduction
+    try:
+        from orchestrator.context_pruner import estimate_tokens
+        full_sample = source_summary + "\n" + (context.ticket.description or "")
+        est = estimate_tokens([{"content": full_sample}])
+        if est > 30000:
+            logger.warning(
+                "Iteration %d prompt source content is ~%d tokens. Trimming tier-2 previews.",
+                iteration, est,
+            )
+            source_summary = "\n\n".join(
+                f"### `{p}`\n```{_lang_for_path(p)}\n{source_section_files[p]}\n```"
+                for p in tier1_paths
+            )
+    except Exception as exc:
+        logger.debug("Context token estimation skipped: %s", exc)
 
     # Build locked test context (read-only).
     locked_tests_summary = ""
@@ -388,16 +586,8 @@ def _generate_code(
             for path, content in list(context.test_files.items())[:10]
         )
 
-    # Human Approver Review Feedback (Gate 2 loop)
-    feedback_section = ""
-    if reviewer_feedback:
-        fb_list = "\n".join(f"- {c}" for c in reviewer_feedback)
-        feedback_section = (
-            "## 🚨 PRIMARY OBJECTIVE: Human Approver Review Feedback\n"
-            "A human reviewer has reviewed the previous Pull Request and explicitly requested the following improvements.\n"
-            "Satisfying ALL points below is your PRIMARY target. Making tests pass is secondary:\n"
-            f"{fb_list}\n\n"
-        )
+    # S3-6: Review feedback formatting
+    feedback_section = _format_reviewer_feedback(reviewer_feedback or [], reviewer_feedback_history)
 
     task_desc = (
         "Your PRIMARY task is to address ALL points raised in the Human Approver's review feedback. "
@@ -542,28 +732,27 @@ def _generate_code(
             for pr in failed_patches:
                 logger.warning("Patch failed for %s: %s", pr.path, pr.errors)
 
-            if not all_succeeded and attempt < _MAX_LOCKED_REJECTIONS:
-                # Build a targeted re-prompt from the failed patches.
-                fail_details = "\n".join(
-                    f"- FILE `{pr.path}`: {'; '.join(pr.errors[:2])}"
-                    for pr in failed_patches
-                )
-                logger.warning(
-                    "All-or-nothing gate: %d patch(es) failed — aborting commit, "
-                    "re-prompting LLM (attempt %d/%d).\n%s",
-                    len(failed_patches), attempt, _MAX_LOCKED_REJECTIONS, fail_details,
-                )
-                prompt = (
-                    f"Your SEARCH/REPLACE blocks contained {len(failed_patches)} "
-                    f"failure(s) that could not be applied:\n\n{fail_details}\n\n"
-                    "These failures are likely because the SEARCH text does not exactly "
-                    "match the current file content (whitespace, surrounding context, "
-                    "or already-applied changes). Please:\n"
-                    "1. Include MORE surrounding lines in your SEARCH block to make it unique.\n"
-                    "2. Make sure the SEARCH text exactly matches the current file content.\n"
-                    "3. Resubmit ONLY the failed patches in corrected SEARCH/REPLACE format."
-                )
-                continue
+            if not all_succeeded:
+                if attempt < _MAX_LOCKED_REJECTIONS:
+                    failed_paths = [pr.path for pr in failed_patches]
+                    fail_details = [
+                        f"FILE `{pr.path}`: {'; '.join(pr.errors[:2])}"
+                        for pr in failed_patches
+                    ]
+                    logger.warning(
+                        "All-or-nothing gate: %d patch(es) failed — aborting commit, "
+                        "re-prompting LLM with current file content (attempt %d/%d).\n%s",
+                        len(failed_patches), attempt, _MAX_LOCKED_REJECTIONS, "\n".join(fail_details),
+                    )
+                    prompt = _build_patch_failure_prompt(fail_details, failed_paths, current_sources)
+                    continue
+                else:
+                    logger.error(
+                        "All-or-nothing gate: %d patch(es) failed and attempts exhausted. "
+                        "Aborting commit to prevent partial code corruption.",
+                        len(failed_patches),
+                    )
+                    return {}
 
         # Check for locked/blocked file violations.
         violations = set(files.keys()) & effective_blocked
@@ -827,15 +1016,3 @@ def _handle_escalation(
         subject=f"[Escalation] Automated resolution failed for {ticket_id}",
         body=message,
     )
-
-
-def _infer_checkpoint_dir(checkpoint: Checkpoint) -> str:
-    """
-    Infer the checkpoint directory from the checkpoint's ticket ID.
-
-    This is a convenience for mid-loop saves where the settings object
-    is not directly available.  The directory is derived from the
-    checkpoint file path pattern used by Checkpoint.save().
-    """
-    # Default fallback — the settings-based dir is passed through main.py.
-    return "./checkpoints"

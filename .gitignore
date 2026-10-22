@@ -54,6 +54,7 @@ htmlcov/
 
 # Pipeline Runtime & Local Data (Checkpoints, Audit Logs)
 checkpoints/
+.checkpoints/
 audit/
 logs/
 *.log

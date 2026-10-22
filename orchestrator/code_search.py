@@ -23,8 +23,15 @@ _SYMBOL_PATTERNS = [
 _SOURCE_GLOBS = (
     "*.py", "*.js", "*.ts", "*.tsx", "*.jsx",
     "*.html", "*.htm", "*.css", "*.scss", "*.sass",
+    # S1-6: expanded to cover non-JS/TS source files
+    "*.java", "*.kt", "*.go", "*.rs", "*.cs", "*.rb",
+    "*.cpp", "*.c", "*.h", "*.swift", "*.scala",
+    "*.php", "*.sh",
     "*.json", "*.yaml", "*.yml",
 )
+
+
+_KNOWN_EXTENSIONS = tuple(g.lstrip("*") for g in _SOURCE_GLOBS)
 
 
 @dataclass
@@ -44,10 +51,9 @@ class ContextExpansionResult:
 def extract_symbols_from_text(text: str) -> list:
     symbols: set = set()
     for token in text.split():
-        token = token.strip(".,;:()[]'\"")
-        if ("/" in token) and any(token.endswith(ext) for ext in
-                [".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".scss"]):
-            symbols.add(token)
+        token = token.strip(".,;:()[]'\"`")
+        if ("/" in token or "\\" in token) and any(token.lower().endswith(ext) for ext in _KNOWN_EXTENSIONS):
+            symbols.add(token.replace("\\", "/"))
     for pattern in _SYMBOL_PATTERNS:
         for m in pattern.finditer(text):
             sym = m.group(1)
@@ -61,33 +67,89 @@ def search_repository_for_symbols(
     symbols: list,
     all_file_paths=None,
     max_results_per_symbol: int = 5,
+    gitlab=None,
+    branch: str = "main",
+    max_api_scans: int = 60,
 ) -> list:
+    """
+    Search source files for symbol occurrences.
+
+    S1-3 FIX: In CI, no local clone exists, so the original disk-read path
+    silently returned an empty list for every query, making Gate-2 context
+    expansion a no-op.  When a ``gitlab`` client is supplied the function
+    now fetches file content via the VCS API instead of reading from disk.
+    The disk-read fallback is preserved for local-dev / test environments.
+
+    Logical protections:
+    - Early loop termination as soon as all symbols have found max results.
+    - Path scoring to prioritize files matching searched symbol names.
+    - Capped API scans (default 60) to protect against rate limits & latency.
+    """
     root = Path(repo_root)
     hits = []
+
+    # Determine the candidate file list.
     if all_file_paths:
-        files_to_search = [
-            root / p for p in all_file_paths
+        candidate_paths = [
+            p for p in all_file_paths
             if _is_searchable_file(p) and not _in_ignored_dir(p)
         ]
+        if gitlab:
+            symbols_lower = [s.lower() for s in symbols]
+
+            def _score_path(p: str) -> int:
+                p_lower = p.lower()
+                return sum(1 for s in symbols_lower if s in p_lower)
+
+            candidate_paths = sorted(candidate_paths, key=_score_path, reverse=True)[:max_api_scans]
+    elif gitlab:
+        # CI mode: no all_file_paths given and no local clone — skip.
+        logger.warning(
+            "No all_file_paths provided with gitlab client; symbol search skipped."
+        )
+        return []
     else:
-        files_to_search = list(_walk_source_files(root))
+        # Local-dev / test mode: walk the disk.
+        candidate_paths = [
+            str(f.relative_to(root)).replace("\\", "/")
+            for f in _walk_source_files(root)
+        ]
 
     sym_counts = {s: 0 for s in symbols}
-    for file_path in files_to_search:
-        if not file_path.is_file():
+
+    for rel_path in candidate_paths:
+        # Early break if all symbols have satisfied max_results_per_symbol
+        if symbols and all(sym_counts.get(s, 0) >= max_results_per_symbol for s in symbols):
+            break
+
+        # Read content — prefer the VCS API when available.
+        text = None
+        if gitlab:
+            try:
+                text = gitlab.get_file_content(rel_path, ref=branch)
+            except Exception:
+                continue
+        else:
+            abs_path = root / rel_path
+            if not abs_path.is_file():
+                continue
+            try:
+                text = abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+        if not text:
             continue
-        try:
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        rel_path = str(file_path.relative_to(root)).replace("\\", "/")
+
         for sym in symbols:
             if sym_counts.get(sym, 0) >= max_results_per_symbol:
                 continue
             for lineno, line in enumerate(text.splitlines(), 1):
                 if sym in line:
-                    hits.append(SearchHit(path=rel_path, line_number=lineno,
-                                          line_content=line.rstrip(), symbol=sym))
+                    hits.append(SearchHit(
+                        path=rel_path, line_number=lineno,
+                        line_content=line.rstrip(), symbol=sym,
+                    ))
                     sym_counts[sym] = sym_counts.get(sym, 0) + 1
                     break
     return hits
@@ -122,10 +184,13 @@ def find_additional_context_files(
                 symbols.remove(sym)
 
     if symbols and (root or all_file_paths):
+        # S1-3 FIX: propagate gitlab + branch so CI-mode search actually works.
         hits = search_repository_for_symbols(
             repo_root=root or Path("."),
             symbols=symbols,
             all_file_paths=all_file_paths,
+            gitlab=gitlab,
+            branch=branch,
         )
         expansion.search_hits = hits
         for hit in hits:

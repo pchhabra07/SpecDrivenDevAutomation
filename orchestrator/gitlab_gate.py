@@ -21,6 +21,7 @@ class GateOutcome(str, Enum):
     APPROVED = "approved"
     TIMEOUT = "timeout"
     CHANGES_REQUESTED = "changes_requested"
+    PENDING = "pending"
 
 
 @dataclass
@@ -34,6 +35,80 @@ class GateResult:
 
 class GateTimeoutError(Exception):
     """Raised when a gate poll exceeds *timeout_hours*."""
+
+
+_APPROVAL_KEYWORDS = {"/approve", "approve", "approved", "lgtm", ":shipit:", "looks good to me"}
+
+
+def check_approval_once(
+    gitlab: Any,
+    mr_iid: int,
+    seen_comments: set[str] | None = None,
+) -> GateResult:
+    """
+    Non-blocking single check of an MR/PR's approval state (S2-1).
+
+    Returns
+    -------
+    GateResult
+        - outcome=APPROVED if required approvals are present.
+        - outcome=CHANGES_REQUESTED if reviewer requested changes or left new comments.
+        - outcome=PENDING if no review decision has been made yet.
+    """
+    if seen_comments is None:
+        seen_comments = set()
+
+    try:
+        if hasattr(gitlab, "get_mr_approvals"):
+            approvals = gitlab.get_mr_approvals(mr_iid)
+        elif hasattr(gitlab, "get_pr_approvals"):
+            approvals = gitlab.get_pr_approvals(mr_iid)
+        else:
+            approvals = {}
+    except Exception as exc:
+        logger.warning("Gate check failed for MR/PR #%d: %s", mr_iid, exc)
+        return GateResult(outcome=GateOutcome.PENDING, approved_by=[], reviewer_comments=[])
+
+    if approvals.get("approved"):
+        comments = _fetch_comments(gitlab, mr_iid)
+        return GateResult(
+            outcome=GateOutcome.APPROVED,
+            approved_by=approvals.get("approved_by", []),
+            reviewer_comments=comments,
+        )
+
+    # Check for explicit CHANGES_REQUESTED review state
+    if approvals.get("changes_requested"):
+        all_comments = _fetch_comments(gitlab, mr_iid)
+        new_comments = [c for c in all_comments if c not in seen_comments]
+        seen_comments.update(all_comments)
+        return GateResult(
+            outcome=GateOutcome.CHANGES_REQUESTED,
+            approved_by=[],
+            reviewer_comments=new_comments or ["Reviewer requested changes on pull request."],
+        )
+
+    # Check for NEW reviewer comments (approval commands or change requests)
+    all_comments = _fetch_comments(gitlab, mr_iid)
+    new_comments = [c for c in all_comments if c not in seen_comments]
+    if new_comments:
+        seen_comments.update(all_comments)
+        for c in new_comments:
+            clean = c.strip().lower()
+            if clean in _APPROVAL_KEYWORDS or clean.startswith("/approve"):
+                logger.info("MR/PR #%d APPROVED via comment: %s", mr_iid, c.strip())
+                return GateResult(
+                    outcome=GateOutcome.APPROVED,
+                    approved_by=["reviewer-comment"],
+                    reviewer_comments=new_comments,
+                )
+        return GateResult(
+            outcome=GateOutcome.CHANGES_REQUESTED,
+            approved_by=[],
+            reviewer_comments=new_comments,
+        )
+
+    return GateResult(outcome=GateOutcome.PENDING, approved_by=[], reviewer_comments=[])
 
 
 def wait_for_approval(
@@ -83,22 +158,33 @@ def wait_for_approval(
                 reviewer_comments=new_comments or ["Reviewer requested changes on pull request."],
             )
 
-        # Check for NEW reviewer comments that signal change requests
+        # Check for NEW reviewer comments (approval commands or change requests)
         all_comments = _fetch_comments(gitlab, mr_iid)
         new_comments = [c for c in all_comments if c not in seen_comments]
 
-        if return_on_changes_requested and new_comments:
-            logger.info(
-                "MR/PR #%d has %d new reviewer comment(s). Returning early on feedback.",
-                mr_iid,
-                len(new_comments),
-            )
+        if new_comments:
             seen_comments.update(all_comments)
-            return GateResult(
-                outcome=GateOutcome.CHANGES_REQUESTED,
-                approved_by=[],
-                reviewer_comments=new_comments,
-            )
+            for c in new_comments:
+                clean = c.strip().lower()
+                if clean in _APPROVAL_KEYWORDS or clean.startswith("/approve"):
+                    logger.info("MR/PR #%d APPROVED via comment keyword: %s", mr_iid, c.strip())
+                    return GateResult(
+                        outcome=GateOutcome.APPROVED,
+                        approved_by=["reviewer-comment"],
+                        reviewer_comments=new_comments,
+                    )
+
+            if return_on_changes_requested:
+                logger.info(
+                    "MR/PR #%d has %d new reviewer comment(s). Returning early on feedback.",
+                    mr_iid,
+                    len(new_comments),
+                )
+                return GateResult(
+                    outcome=GateOutcome.CHANGES_REQUESTED,
+                    approved_by=[],
+                    reviewer_comments=new_comments,
+                )
 
         logger.debug("MR/PR #%d not yet approved — polling again in %ds", mr_iid, poll_interval_seconds)
         time.sleep(poll_interval_seconds)

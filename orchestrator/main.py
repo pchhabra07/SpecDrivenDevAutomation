@@ -23,6 +23,7 @@ from typing import Any
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.config import Settings, get_settings
+from orchestrator.exceptions import GatePendingError
 from orchestrator.gitlab_client import GitLabClient
 from orchestrator.jira_client import JiraClient
 from orchestrator.llm_client import LLMClient
@@ -139,6 +140,7 @@ def run_pipeline(
     # ── Checkpoint: resume or create ────────────────────────────────────
     checkpoint = Checkpoint.load(ticket_id, settings.checkpoint_dir)
     if checkpoint:
+        checkpoint.checkpoint_dir = settings.checkpoint_dir
         if checkpoint.repo_id and str(checkpoint.repo_id) != str(gitlab.project_id):
             mapped_repos = set(str(v) for v in repo_resolver.mapping.values()) if repo_resolver else set()
             if str(checkpoint.repo_id) in mapped_repos:
@@ -151,7 +153,7 @@ def run_pipeline(
                     checkpoint.repo_id,
                     gitlab.project_id,
                 )
-                checkpoint = Checkpoint(ticket_id=ticket_id)
+                checkpoint = Checkpoint(ticket_id=ticket_id, checkpoint_dir=settings.checkpoint_dir)
                 checkpoint.repo_id = gitlab.project_id
 
         if checkpoint.current_stage > 1:
@@ -165,7 +167,7 @@ def run_pipeline(
         else:
             logger.info("Starting fresh from Stage 1.")
     else:
-        checkpoint = Checkpoint(ticket_id=ticket_id)
+        checkpoint = Checkpoint(ticket_id=ticket_id, checkpoint_dir=settings.checkpoint_dir)
         checkpoint.repo_id = gitlab.project_id
         logger.info("No checkpoint found — starting fresh.")
 
@@ -201,6 +203,7 @@ def run_pipeline(
                 audit=audit,
                 qualifying_label=settings.qualifying_label,
                 repo_resolver=repo_resolver,
+                max_context_test_files=settings.max_context_test_files,
             )
             checkpoint.conversation_history = llm.history
             checkpoint.save(settings.checkpoint_dir)
@@ -218,26 +221,43 @@ def run_pipeline(
                 audit=audit,
                 qualifying_label=settings.qualifying_label,
                 repo_resolver=repo_resolver,
+                max_context_test_files=settings.max_context_test_files,
             )
 
         # ── Stage 2: Generate Tests + Gate 1 ────────────────────────────
         if checkpoint.current_stage <= 2 and not checkpoint.gate1_approved:
             logger.info("▶ Stage 2: Generate Test Cases + Human Gate 1")
-            locked_tests = stage2_test_gen.run(
-                context=context,
-                gitlab=gitlab,
-                llm=llm,
-                checkpoint=checkpoint,
-                audit=audit,
-                gate_poll_interval=settings.gate_poll_interval_seconds,
-                gate_timeout_hours=settings.gate_timeout_hours,
-            )
-            checkpoint.conversation_history = llm.history
-            checkpoint.save(settings.checkpoint_dir)
-            logger.info(
-                "Stage 2 complete — %d test file(s) locked.",
-                len(locked_tests),
-            )
+            try:
+                locked_tests = stage2_test_gen.run(
+                    context=context,
+                    gitlab=gitlab,
+                    llm=llm,
+                    checkpoint=checkpoint,
+                    audit=audit,
+                    gate_poll_interval=settings.gate_poll_interval_seconds,
+                    gate_timeout_hours=settings.gate_timeout_hours,
+                    max_revision_cycles=settings.max_gate1_revision_cycles,
+                    test_preflight_max_repairs=settings.test_preflight_max_repairs,
+                    blocking_gate=settings.blocking_gates,
+                    checkpoint_dir=settings.checkpoint_dir,
+                )
+                checkpoint.conversation_history = llm.history
+                checkpoint.save(settings.checkpoint_dir)
+                logger.info(
+                    "Stage 2 complete — %d test file(s) locked.",
+                    len(locked_tests),
+                )
+            except GatePendingError as e:
+                checkpoint.conversation_history = llm.history
+                checkpoint.save(settings.checkpoint_dir)
+                logger.info(
+                    "Pipeline suspended at %s for ticket %s (PR/MR #%d). "
+                    "Ticket is parked until review event occurs.",
+                    e.gate_name,
+                    ticket_id,
+                    e.mr_iid,
+                )
+                return 0
 
         # ── Stages 3, 4, 5 Loop with Reviewer Feedback (FR-21) ──────────
         while True:
@@ -257,6 +277,7 @@ def run_pipeline(
                     slack_webhook_url=settings.slack_webhook_url,
                     escalation_email=settings.escalation_email,
                     reviewer_feedback=checkpoint.reviewer_feedback,
+                    reuse_stage3_final_pipeline=settings.reuse_stage3_final_pipeline,
                 )
                 checkpoint.conversation_history = llm.history
                 checkpoint.save(settings.checkpoint_dir)
@@ -274,8 +295,64 @@ def run_pipeline(
                     ci_timeout_minutes=settings.ci_timeout_minutes,
                     sonar_configured=bool(settings.sonar_host_url),
                     coverage_threshold=settings.coverage_threshold,
+                    reuse_stage3_pipeline=settings.reuse_stage3_final_pipeline,
                 )
                 checkpoint.save(settings.checkpoint_dir)
+
+                # S4-1: Repair loop for Stage 4 gate failures before escalating
+                if not validation_result.passed:
+                    failed_gates = [g for g in validation_result.gates if g.required and not g.passed]
+                    logger.warning(
+                        "Stage 4 validation FAILED on required gates: %s",
+                        [g.name for g in failed_gates],
+                    )
+
+                    repair_attempts = 0
+                    max_repairs = getattr(settings, "max_stage4_repair_attempts", 1)
+
+                    while not validation_result.passed and repair_attempts < max_repairs:
+                        repair_attempts += 1
+                        logger.info(
+                            "Attempting Stage 4 LLM repair (attempt %d/%d) for gates: %s",
+                            repair_attempts, max_repairs, [g.name for g in failed_gates],
+                        )
+                        gate_logs: dict[str, str] = {}
+                        for gate in failed_gates:
+                            log = ""
+                            if hasattr(gitlab, "get_job_log"):
+                                log = gitlab.get_job_log(validation_result.pipeline_id, gate.name)
+                            if log:
+                                gate_logs[gate.name] = log
+
+                        if not gate_logs:
+                            gate_logs = {g.name: f"Quality gate '{g.name}' failed with status '{g.status}'." for g in failed_gates}
+
+                        repaired = _attempt_stage4_repair(
+                            context=context,
+                            checkpoint=checkpoint,
+                            gitlab=gitlab,
+                            llm=llm,
+                            audit=audit,
+                            gate_logs=gate_logs,
+                        )
+                        if not repaired:
+                            logger.error("Stage 4 repair produced no valid changes.")
+                            break
+
+                        # Re-run Stage 4 validation with a fresh CI pipeline (not reused)
+                        validation_result = stage4_validation.run(
+                            code_branch=checkpoint.code_branch,
+                            gitlab=gitlab,
+                            checkpoint=checkpoint,
+                            audit=audit,
+                            ci_poll_interval=settings.ci_poll_interval_seconds,
+                            ci_timeout_minutes=settings.ci_timeout_minutes,
+                            sonar_configured=bool(settings.sonar_host_url),
+                            coverage_threshold=settings.coverage_threshold,
+                            reuse_stage3_pipeline=False,
+                        )
+                        checkpoint.save(settings.checkpoint_dir)
+                        failed_gates = [g for g in validation_result.gates if g.required and not g.passed]
 
                 if not validation_result.passed:
                     logger.error(
@@ -294,20 +371,53 @@ def run_pipeline(
 
             # ── Stage 5: PR Promotion & Gate 2 ──────────────────────────
             logger.info("▶ Stage 5: PR Promotion & Human Gate 2")
-            stage5_result = stage5_pr.run(
-                ticket_id=ticket_id,
-                context=context,
-                validation_result=validation_result,
-                checkpoint=checkpoint,
-                audit=audit,
-                gitlab=gitlab,
-                jira=jira,
-                gate_poll_interval=settings.gate_poll_interval_seconds,
-                gate_timeout_hours=settings.gate_timeout_hours,
-                slack_webhook_url=settings.slack_webhook_url,
-                escalation_email=settings.escalation_email,
-            )
+            try:
+                stage5_result = stage5_pr.run(
+                    ticket_id=ticket_id,
+                    context=context,
+                    validation_result=validation_result,
+                    checkpoint=checkpoint,
+                    audit=audit,
+                    gitlab=gitlab,
+                    jira=jira,
+                    gate_poll_interval=settings.gate_poll_interval_seconds,
+                    gate_timeout_hours=settings.gate_timeout_hours,
+                    slack_webhook_url=settings.slack_webhook_url,
+                    escalation_email=settings.escalation_email,
+                    blocking_gate=settings.blocking_gates,
+                    checkpoint_dir=settings.checkpoint_dir,
+                )
+            except GatePendingError as e:
+                checkpoint.conversation_history = llm.history
+                checkpoint.save(settings.checkpoint_dir)
+                logger.info(
+                    "Pipeline suspended at %s for ticket %s (PR/MR #%d). "
+                    "Ticket is parked until review event occurs.",
+                    e.gate_name,
+                    ticket_id,
+                    e.mr_iid,
+                )
+                audit.log(
+                    stage=5,
+                    event_type="gate2_pending",
+                    payload={"mr_iid": e.mr_iid},
+                )
+                return 0
+
             checkpoint.save(settings.checkpoint_dir)
+
+            if stage5_result.status == "timeout":
+                logger.error("Gate 2 timed out for PR #%d on ticket %s.", stage5_result.mr_iid, ticket_id)
+                jira.post_lifecycle_comment(
+                    ticket_id=ticket_id,
+                    title="Gate 2 Approval Timeout",
+                    message=(
+                        f"Gate 2 approval timed out after {settings.gate_timeout_hours} hours on PR #{stage5_result.mr_iid}. "
+                        "Pipeline suspended. Human intervention required."
+                    ),
+                    mr_url=stage5_result.mr_url,
+                )
+                return 1
 
             if stage5_result.approved:
                 logger.info("Stage 5 complete — MR !%d approved by reviewer.", stage5_result.mr_iid)
@@ -334,6 +444,7 @@ def run_pipeline(
 
                 checkpoint.review_iteration_count += 1
                 checkpoint.reviewer_feedback = stage5_result.reviewer_feedback
+                checkpoint.reviewer_feedback_history.append(list(stage5_result.reviewer_feedback))
                 logger.info(
                     "Reviewer requested changes (cycle %d/%d). Re-routing to Stage 3.",
                     checkpoint.review_iteration_count,
@@ -389,6 +500,129 @@ def run_pipeline(
         return 1
 
 
+def _attempt_stage4_repair(
+    context: stage1_context.TicketContext,
+    checkpoint: Checkpoint,
+    gitlab: Any,
+    llm: LLMClient,
+    audit: AuditLogger,
+    gate_logs: dict[str, str],
+) -> bool:
+    """
+    Prompt the LLM to fix Stage 4 validation failures (e.g. lint, SAST, security findings).
+    Pre-flights the patched files, verifies tamper protection, and commits to code_branch.
+    Returns True if valid repaired files were committed.
+    """
+    from orchestrator.diff_patcher import apply_patches_to_sources, parse_llm_response
+    from orchestrator.preflight_checker import check_all
+    from orchestrator.stages.stage3_code_gen import _lang_for_path
+
+    gate_sections = []
+    for gate_name, log in gate_logs.items():
+        log_lines = log.strip().splitlines()
+        trimmed_log = "\n".join(log_lines[-150:]) if len(log_lines) > 150 else log.strip()
+        gate_sections.append(f"## Gate Failure: {gate_name.upper()}\n```\n{trimmed_log}\n```")
+
+    gate_failure_section = "\n\n".join(gate_sections)
+
+    # Refresh current sources from code_branch
+    current_sources: dict[str, str] = dict(context.source_files)
+    for path in list(current_sources.keys()):
+        try:
+            content = gitlab.get_file_content(path, ref=checkpoint.code_branch)
+            if content is not None:
+                current_sources[path] = content
+        except Exception:
+            pass
+
+    # Exclude locked test files and CI workflows from editable sources
+    locked_paths = set(checkpoint.locked_test_hashes.keys())
+    blocked_paths = set(locked_paths)
+    if checkpoint.ci_workflow_path:
+        blocked_paths.add(checkpoint.ci_workflow_path)
+
+    editable_sources = {k: v for k, v in current_sources.items() if k not in blocked_paths}
+
+    source_parts = []
+    for path, content in list(editable_sources.items())[:10]:
+        source_parts.append(f"### `{path}`\n```{_lang_for_path(path)}\n{content}\n```")
+    source_summary = "\n\n".join(source_parts)
+
+    prompt = (
+        "You are a senior software engineer acting as an automated repair agent. "
+        "The automated code generation passed initial target tests, but subsequent "
+        "CI/CD quality gates (such as lint, SAST, or dependency checks) failed.\n\n"
+        "Your task is to fix the issues described in the gate logs below.\n\n"
+        f"{gate_failure_section}\n\n"
+        f"## Current Source Files\n{source_summary}\n\n"
+        "## Critical Rules\n"
+        "1. Fix ONLY the lint errors, security warnings, or code quality issues reported above.\n"
+        "2. Do NOT change test logic, acceptance criteria, or unrelated features.\n"
+        "3. IMMUTABLE FILES: Do NOT modify any locked test files or CI workflow files.\n"
+        "4. Respond ONLY using SEARCH/REPLACE blocks for modified files:\n"
+        "```\n"
+        "// FILE: path/to/file.ext\n"
+        "<<<<<<< SEARCH\n"
+        "[exact original lines]\n"
+        "=======\n"
+        "[replacement lines]\n"
+        ">>>>>>> REPLACE\n"
+        "```"
+    )
+
+    llm.clear_history(keep_system=True)
+    response = llm.chat(
+        prompt,
+        stage=4,
+        call_purpose="Stage 4 validation gate failure repair",
+        attached_files=list(editable_sources.keys()),
+    )
+    raw_content = response.get("content", "")
+    parsed = parse_llm_response(raw_content)
+    if not parsed:
+        logger.warning("Stage 4 repair: LLM returned no SEARCH/REPLACE blocks.")
+        return False
+
+    fixed_files, patch_results, all_succeeded = apply_patches_to_sources(parsed, current_sources)
+    if not all_succeeded or not fixed_files:
+        logger.warning("Stage 4 repair: Patches failed to apply cleanly.")
+        return False
+
+    # Check for immutable file violations
+    violations = set(fixed_files.keys()) & blocked_paths
+    if violations:
+        logger.warning("Stage 4 repair: LLM attempted to modify locked files: %s", violations)
+        return False
+
+    # Pre-flight syntax verification
+    passed_preflight, preflight_results = check_all(fixed_files)
+    if not passed_preflight:
+        logger.warning(
+            "Stage 4 repair: Repaired files failed pre-flight syntax check: %s",
+            [r.errors for r in preflight_results if not r.passed],
+        )
+        return False
+
+    try:
+        gitlab.commit_files(
+            branch=checkpoint.code_branch,
+            files=fixed_files,
+            commit_message="[spec-driven] Stage 4 auto-repair: fix CI quality gate failures",
+            blocked_paths=blocked_paths,
+        )
+        checkpoint.modified_files = list(set(checkpoint.modified_files) | set(fixed_files.keys()))
+        audit.log(
+            stage=4,
+            event_type="stage4_repair_committed",
+            payload={"fixed_files": list(fixed_files.keys())},
+        )
+        logger.info("Stage 4 repair: Successfully committed fixes for %d file(s).", len(fixed_files))
+        return True
+    except Exception as exc:
+        logger.error("Stage 4 repair commit failed: %s", exc)
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Spec-Driven Development Pipeline — Orchestrator",
@@ -419,10 +653,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Enable raw HTTP/socket transport debug logging (very verbose)",
     )
+    parser.add_argument(
+        "--blocking-gates",
+        action="store_true",
+        default=None,
+        help="Wait synchronously for human gates (for CLI/dev use; overrides settings)",
+    )
+    parser.add_argument(
+        "--non-blocking-gates",
+        action="store_true",
+        default=None,
+        help="Do not wait synchronously for human gates; park pipeline and exit cleanly",
+    )
     args = parser.parse_args(argv)
     _setup_logging(args.verbose, args.debug_wire)
 
     settings = get_settings()
+    if args.blocking_gates:
+        settings.blocking_gates = True
+    elif args.non_blocking_gates:
+        settings.blocking_gates = False
 
     if args.server:
         import uvicorn

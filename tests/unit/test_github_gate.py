@@ -160,3 +160,27 @@ class TestGitHubWaitForApproval:
         assert result.outcome == GateOutcome.APPROVED
         assert result.reviewer_comments == []
 
+    def test_approval_via_comment_keyword(self):
+        """Conversational approval keywords like 'Approved', '/approve', 'lgtm' must approve Gate."""
+        mock_gh = MagicMock()
+        mock_gh.get_pr_approvals.return_value = {
+            "approved": False,
+            "approved_by": [],
+            "changes_requested": False,
+        }
+        mock_gh.get_pr_notes.return_value = [
+            {"body": "Approved", "system": False},
+        ]
+
+        result = wait_for_approval(
+            client=mock_gh,
+            pr_number=107,
+            poll_interval_seconds=0,
+            timeout_hours=1,
+            return_on_changes_requested=True,
+        )
+
+        assert result.outcome == GateOutcome.APPROVED
+        assert "reviewer-comment" in result.approved_by
+
+

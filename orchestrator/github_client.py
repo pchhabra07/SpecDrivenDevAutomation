@@ -273,14 +273,47 @@ class GitHubClient:
                 draft=draft,
             )
         except GithubException as exc:
+            error_str = str(exc).lower()
+            if "already exists" in error_str:
+                logger.info("Pull request already exists for %s; fetching existing PR", source_branch)
+                pulls = list(self._repo.get_pulls(state="open"))
+                matched = [p for p in pulls if p.head.ref == source_branch]
+                if matched:
+                    pr = matched[0]
+                    info = PullRequestInfo(
+                        number=pr.number,
+                        web_url=pr.html_url,
+                        state=pr.state,
+                        draft=getattr(pr, "draft", False),
+                    )
+                    logger.info("Found existing PR #%d: %s", info.number, info.web_url)
+                    return info
+
             # Fallback for accounts/plans without native draft PRs
             logger.warning("Native draft PR failed (%s); creating standard PR with Draft title", exc)
-            pr = self._repo.create_pull(
-                title=pr_title,
-                body=description,
-                head=source_branch,
-                base=target_branch,
-            )
+            try:
+                pr = self._repo.create_pull(
+                    title=pr_title,
+                    body=description,
+                    head=source_branch,
+                    base=target_branch,
+                )
+            except GithubException as fallback_exc:
+                if "already exists" in str(fallback_exc).lower():
+                    logger.info("Pull request already exists for %s; fetching existing PR", source_branch)
+                    pulls = list(self._repo.get_pulls(state="open"))
+                    matched = [p for p in pulls if p.head.ref == source_branch]
+                    if matched:
+                        pr = matched[0]
+                        info = PullRequestInfo(
+                            number=pr.number,
+                            web_url=pr.html_url,
+                            state=pr.state,
+                            draft=getattr(pr, "draft", False),
+                        )
+                        logger.info("Found existing PR #%d: %s", info.number, info.web_url)
+                        return info
+                raise
 
         info = PullRequestInfo(
             number=pr.number,
@@ -308,41 +341,51 @@ class GitHubClient:
             draft=draft,
         )
 
+    def get_pr_url(self, pr_number: int) -> str:
+        """Return the canonical web URL for a pull request (S5-2)."""
+        try:
+            return f"{self._repo.html_url}/pull/{pr_number}"
+        except Exception:
+            logger.warning("Could not determine PR URL — returning generic placeholder.")
+            return f"https://github.com/pull/{pr_number}"
+
     def get_pr_approvals(self, pr_number: int) -> dict[str, Any]:
         """
-        Fetch approval status of a Pull Request.
-        Inspects review states ('APPROVED', 'CHANGES_REQUESTED') and comments.
+        Fetch approval status of a Pull Request (S5-3).
+        Inspects formal review states ('APPROVED', 'CHANGES_REQUESTED') from
+        GitHub Reviews API, tracking the latest review per author.
+        Conversational issue comments are not treated as formal approvals/changes.
         """
         pr = self._repo.get_pull(pr_number)
         reviews = list(pr.get_reviews())
 
-        approved_by: list[str] = []
-        changes_requested = False
-
+        # Track the latest decision per reviewer.
+        # Note: COMMENTED reviews do not dismiss or override an earlier
+        # APPROVED or CHANGES_REQUESTED review. DISMISSED clears the decision.
+        latest_review_per_user: dict[str, str] = {}
         for r in reviews:
             state = (r.state or "").upper()
             author = r.user.login if r.user else "reviewer"
-            if state == "APPROVED":
-                if author not in approved_by:
-                    approved_by.append(author)
-            elif state == "CHANGES_REQUESTED":
-                changes_requested = True
+            if state in ("APPROVED", "CHANGES_REQUESTED"):
+                latest_review_per_user[author] = state
+            elif state == "DISMISSED":
+                latest_review_per_user[author] = "DISMISSED"
+            elif author not in latest_review_per_user:
+                latest_review_per_user[author] = state
 
-        # Also inspect issue comments for explicit LGTM/approval
-        issue = self._repo.get_issue(pr_number)
-        for c in issue.get_comments():
-            body = (c.body or "").upper()
-            author = c.user.login if c.user else "reviewer"
-            if "APPROVED" in body or "LGTM" in body:
-                if author not in approved_by:
-                    approved_by.append(author)
-            elif "CHANGES_REQUESTED" in body or "REQUEST_CHANGES" in body:
-                changes_requested = True
+        approved_by: list[str] = []
+        changes_requested_by: list[str] = []
+        for author, state in latest_review_per_user.items():
+            if state == "APPROVED":
+                approved_by.append(author)
+            elif state == "CHANGES_REQUESTED":
+                changes_requested_by.append(author)
 
         return {
             "approved": len(approved_by) > 0,
             "approved_by": approved_by,
-            "changes_requested": changes_requested,
+            "changes_requested": len(changes_requested_by) > 0,
+            "changes_requested_by": changes_requested_by,
         }
 
     def get_mr_approvals(self, pr_number: int) -> dict[str, Any]:
@@ -564,6 +607,19 @@ class GitHubClient:
             logger.warning("Could not fetch logs for job %d: %s", job_id, exc)
         return ""
 
+    def get_job_log(self, run_or_job_id: int, job_name: str | None = None) -> str:
+        """Fetch log output for a workflow job by ID or by (run_id, job_name)."""
+        if job_name is not None:
+            try:
+                run = self._repo.get_workflow_run(run_or_job_id)
+                for job in run.jobs():
+                    if job.name.lower() == job_name.lower() or job_name.lower() in job.name.lower():
+                        return self.get_job_trace(job.id)
+            except Exception as exc:
+                logger.warning("Could not fetch log for job '%s' in run %d: %s", job_name, run_or_job_id, exc)
+            return ""
+        return self.get_job_trace(run_or_job_id)
+
     def get_workflow_status(self, run_id: int) -> WorkflowRunResult:
         """Poll the status of a GitHub Actions workflow run."""
         try:
@@ -615,12 +671,3 @@ class GitHubClient:
     def get_pipeline_status(self, run_id: int) -> WorkflowRunResult:
         """Compatibility alias for get_workflow_status."""
         return self.get_workflow_status(run_id)
-
-    def get_job_log(self, job_id: int) -> str:
-        """Fetch logs for a specific job."""
-        try:
-            # PyGithub doesn't expose direct raw log streaming in all versions,
-            # but job objects provide summary or we can query job
-            return f"Logs for job {job_id}"
-        except Exception as exc:
-            return f"Could not retrieve log: {exc}"

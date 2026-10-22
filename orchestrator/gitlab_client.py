@@ -200,6 +200,14 @@ class GitLabClient:
         logger.info("MR !%d created: %s", info.iid, info.web_url)
         return info
 
+    def get_pr_url(self, mr_iid: int) -> str:
+        """Return the canonical web URL for a merge request (S5-2)."""
+        try:
+            return f"{self._project.web_url}/-/merge_requests/{mr_iid}"
+        except Exception:
+            logger.warning("Could not determine MR URL — returning generic placeholder.")
+            return f"https://gitlab.com/merge_requests/{mr_iid}"
+
     def get_mr_approvals(self, mr_iid: int) -> dict[str, Any]:
         """
         Fetch the approvals state of a merge request.
@@ -214,7 +222,12 @@ class GitLabClient:
             "approved_by": [
                 a["user"]["username"] for a in getattr(approvals, "approved_by", [])
             ],
+            "changes_requested": False,
         }
+
+    def get_pr_approvals(self, mr_iid: int) -> dict[str, Any]:
+        """Compatibility alias for get_mr_approvals."""
+        return self.get_mr_approvals(mr_iid)
 
     def update_mr_description(self, mr_iid: int, description: str) -> None:
         """Update the description of an existing MR."""
@@ -261,6 +274,10 @@ class GitLabClient:
             if not n.system  # skip system-generated notes
         ]
 
+    def get_pr_notes(self, mr_iid: int) -> list[dict[str, Any]]:
+        """Compatibility alias for get_mr_notes (S5-4)."""
+        return self.get_mr_notes(mr_iid)
+
     def add_mr_comment(self, mr_iid: int, comment: str) -> None:
         """Add a comment/note to a Merge Request."""
         mr = self._project.mergerequests.get(mr_iid)
@@ -302,3 +319,26 @@ class GitLabClient:
                 for j in jobs
             ],
         )
+
+    def get_job_trace(self, job_id: int) -> str:
+        """Fetch raw log output for a GitLab job by ID."""
+        try:
+            job = self._project.jobs.get(job_id)
+            trace = job.trace()
+            if isinstance(trace, bytes):
+                return trace.decode("utf-8", errors="replace")
+            return str(trace) if trace else ""
+        except Exception as exc:
+            logger.warning("Could not fetch trace for job %d: %s", job_id, exc)
+            return ""
+
+    def get_job_log(self, pipeline_id: int, job_name: str) -> str:
+        """Fetch log for a specific job name in a pipeline."""
+        try:
+            pl = self._project.pipelines.get(pipeline_id)
+            for j in pl.jobs.list(get_all=True):
+                if j.name.lower() == job_name.lower() or job_name.lower() in j.name.lower():
+                    return self.get_job_trace(j.id)
+        except Exception as exc:
+            logger.warning("Could not fetch log for job '%s' in pipeline %d: %s", job_name, pipeline_id, exc)
+        return ""

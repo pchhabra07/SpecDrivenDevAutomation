@@ -132,11 +132,33 @@ def _apply_block(content: str, blk):
     if cnt == 1:
         return content.replace(st, blk.replace, 1), None
     if cnt > 1:
-        return content, f"AMBIGUOUS: {cnt} occurrences.\nSEARCH: {st[:120]!r}"
-    patched, ok = _fuzzy_replace(content, st, blk.replace)
-    if ok:
-        return patched, None
-    return content, f"NOT FOUND.\nSEARCH: {st[:200]!r}"
+        lines_preview = content.split(st)[0].count("\n") + 1
+        return content, (
+            f"AMBIGUOUS: {cnt} exact occurrences found. First occurrence around line {lines_preview}. "
+            f"Make your SEARCH text more specific by including more surrounding context lines.\n"
+            f"SEARCH: {st[:120]!r}"
+        )
+
+    # Check fuzzy matches
+    nc = [" ".join(l.split()) for l in content.splitlines()]
+    ns = [" ".join(l.split()) for l in st.splitlines()]
+    if ns:
+        n = len(ns)
+        match_positions = [i for i in range(len(nc) - n + 1) if nc[i:i+n] == ns]
+        if len(match_positions) > 1:
+            return content, (
+                f"FUZZY_AMBIGUOUS: Normalized SEARCH text matches {len(match_positions)} locations. "
+                f"First occurrence around line {match_positions[0] + 1}. "
+                f"Add more surrounding context lines to make it unique.\n"
+                f"SEARCH: {st[:120]!r}"
+            )
+        if len(match_positions) == 1:
+            i = match_positions[0]
+            cl = content.splitlines()
+            out = cl[:i] + blk.replace.splitlines() + cl[i+n:]
+            return "\n".join(out), None
+
+    return content, f"NOT FOUND: SEARCH block not found in file content.\nSEARCH: {st[:200]!r}"
 
 
 def _fuzzy_replace(content: str, search: str, replace: str):
@@ -145,11 +167,12 @@ def _fuzzy_replace(content: str, search: str, replace: str):
     if not ns:
         return content, False
     n = len(ns)
-    for i in range(len(nc) - n + 1):
-        if nc[i:i+n] == ns:
-            cl = content.splitlines()
-            out = cl[:i] + replace.splitlines() + cl[i+n:]
-            return "\n".join(out), True
+    match_positions = [i for i in range(len(nc) - n + 1) if nc[i:i+n] == ns]
+    if len(match_positions) == 1:
+        i = match_positions[0]
+        cl = content.splitlines()
+        out = cl[:i] + replace.splitlines() + cl[i+n:]
+        return "\n".join(out), True
     return content, False
 
 

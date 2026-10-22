@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,8 +29,11 @@ from orchestrator.repo_resolver import RepoResolver
 
 logger = logging.getLogger(__name__)
 
-# Glob patterns for JS/TS test files.
+# ---------------------------------------------------------------------------
+# S1-6 FIX — Expanded test-file glob patterns to cover non-JS/TS conventions.
+# ---------------------------------------------------------------------------
 _TEST_PATTERNS = (
+    # JavaScript / TypeScript
     "*.test.ts",
     "*.test.tsx",
     "*.spec.ts",
@@ -38,20 +42,70 @@ _TEST_PATTERNS = (
     "*.test.jsx",
     "*.spec.js",
     "*.spec.jsx",
+    # Python (pytest / unittest)
+    "test_*.py",
+    "*_test.py",
+    # Go
+    "*_test.go",
+    # Java / Kotlin
+    "*Test.java",
+    "*Tests.java",
+    "*Spec.java",
+    "*Test.kt",
+    # Ruby
+    "*_spec.rb",
+    "*_test.rb",
+    # C#
+    "*Tests.cs",
+    "*Test.cs",
+    # Rust tests are inline modules — no standalone file convention.
 )
 
-# Glob patterns for source files (excluding tests, configs, assets).
+# ---------------------------------------------------------------------------
+# S1-6 FIX — Expanded source-file extensions to include Java, Go, Rust, etc.
+# ---------------------------------------------------------------------------
 _SOURCE_EXTENSIONS = (
+    # JavaScript / TypeScript
     "*.ts",
     "*.tsx",
     "*.js",
     "*.jsx",
+    # Web / Styles
     "*.html",
     "*.htm",
     "*.css",
     "*.scss",
     "*.sass",
+    # Python
     "*.py",
+    # Java / Kotlin / Groovy
+    "*.java",
+    "*.kt",
+    "*.kts",
+    "*.groovy",
+    # Go
+    "*.go",
+    # Rust
+    "*.rs",
+    # C / C++
+    "*.c",
+    "*.cpp",
+    "*.cc",
+    "*.h",
+    "*.hpp",
+    # C#
+    "*.cs",
+    # Ruby
+    "*.rb",
+    # PHP
+    "*.php",
+    # Swift
+    "*.swift",
+    # Scala
+    "*.scala",
+    # Shell scripts
+    "*.sh",
+    "*.bash",
 )
 
 _IGNORE_DIRS = (
@@ -64,6 +118,70 @@ _IGNORE_DIRS = (
 )
 
 
+class _ThreadLocalDict(dict):
+    """
+    A thread-safe dict proxy that keeps separate storage per thread while
+    maintaining standard dict interface for tests and module-level access.
+    Prevents cache collision and race conditions during concurrent runs.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._local = threading.local()
+
+    def _get_data(self) -> dict[str, str]:
+        if not hasattr(self._local, "data"):
+            self._local.data = {}
+        return self._local.data
+
+    def __getitem__(self, key: str) -> str:
+        return self._get_data()[key]
+
+    def __setitem__(self, key: str, value: str) -> None:
+        self._get_data()[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._get_data()[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._get_data()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._get_data().get(key, default)
+
+    def clear(self) -> None:
+        self._get_data().clear()
+
+    def __len__(self) -> int:
+        return len(self._get_data())
+
+    def __iter__(self):
+        return iter(self._get_data())
+
+    def items(self):
+        return self._get_data().items()
+
+    def keys(self):
+        return self._get_data().keys()
+
+    def values(self):
+        return self._get_data().values()
+
+
+# ---------------------------------------------------------------------------
+# S1-1 FIX — Thread-isolated content cache so _build_snippet_index pre-fetches
+# don't result in duplicate API calls when the run() loop later reads the
+# same files, with zero thread contention or cross-ticket state leakage.
+# ---------------------------------------------------------------------------
+_snippet_content_cache: _ThreadLocalDict = _ThreadLocalDict()
+
+# ---------------------------------------------------------------------------
+# S1-2 FIX — Minimum number of files the LLM must return before a
+# low-confidence warning is emitted.
+# ---------------------------------------------------------------------------
+_LLM_MIN_RETURN_THRESHOLD = 3
+
+
 @dataclass
 class TicketContext:
     """Everything the downstream stages need to know about a ticket."""
@@ -73,6 +191,10 @@ class TicketContext:
     source_files: dict[str, str]  # {path: content}
     test_files: dict[str, str]    # {path: content}
     all_file_paths: list[str]     # full tree listing (paths only)
+    # S1-5 FIX — paths selected by the LLM before symbol-scored padding.
+    # Downstream stages use these as their priority-15 slice instead of
+    # relying on dict-insertion order (which mixes LLM-selected and padded).
+    llm_selected_paths: list[str] = field(default_factory=list)
 
 
 _INELIGIBLE_KEYWORDS = (
@@ -106,6 +228,7 @@ def run(
     audit: AuditLogger,
     qualifying_label: str,
     repo_resolver: RepoResolver | None = None,
+    max_context_test_files: int = 10,
 ) -> TicketContext:
     """
     Execute Stage 1: fetch ticket data, enumerate repo, fetch relevant files.
@@ -128,11 +251,18 @@ def run(
         The label the ticket must carry to be eligible.
     repo_resolver : RepoResolver | None
         Optional repository resolver for dynamic multi-repo routing (Phase 5).
+    max_context_test_files : int
+        S1-4 — Maximum number of test files to include in context.  Defaults to
+        10; pass ``settings.max_context_test_files`` from the caller to make it
+        configurable via environment variable.
 
     Returns
     -------
     TicketContext
     """
+    # Always start with a clean per-run content cache.
+    _snippet_content_cache.clear()
+
     audit.log(stage=1, event_type="stage1_start")
 
     # ── 1. Fetch ticket ─────────────────────────────────────────────────
@@ -209,83 +339,137 @@ def run(
     logger.info("Found %d files: %d source, %d test",
                 len(all_paths), len(source_paths), len(test_paths))
 
-    # ── 4. Fetch test file contents (always — needed for context) ──────
-    logger.info("Fetching %d test file(s)…", len(test_paths))
+    # ── 4. Extract ticket symbols (shared by multiple steps below) ──────
+    ticket_text = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
+    symbols = extract_symbols_from_text(ticket_text)
+    if not symbols and ticket.summary:
+        # Fallback for plain-English tickets without explicit code syntax:
+        # extract significant alphanumeric words (>=4 chars) from summary.
+        stop_words = {
+            "this", "that", "with", "from", "when", "then", "have", "been",
+            "will", "should", "fix", "issue", "bug", "error", "fail", "fails",
+            "cant", "does", "cant", "must", "user", "page", "button",
+        }
+        words = [w.strip(".,;:()[]'\"`").lower() for w in ticket.summary.split()]
+        symbols = [w for w in words if len(w) >= 4 and w not in stop_words]
+
+    if symbols:
+        logger.info("Extracted %d symbols from ticket: %s", len(symbols), symbols[:15])
+
+    # ── 5. Fetch test files — S1-4 FIX: rank by symbol relevance first ─
+    # On large repos with hundreds of test files, fetching all of them burns
+    # API quota and overflows the downstream LLM context window.  Instead,
+    # sort by how many ticket symbols appear in the path and take the top N.
+    ranked_test_paths = _sort_by_symbol_relevance(test_paths, symbols)
+    n_test = min(max_context_test_files, len(ranked_test_paths))
+    logger.info(
+        "Fetching top %d of %d test file(s) by symbol relevance…",
+        n_test,
+        len(ranked_test_paths),
+    )
     test_files: dict[str, str] = {}
-    for path in test_paths:
+    for path in ranked_test_paths[:max_context_test_files]:
         try:
             test_files[path] = gitlab.get_file_content(path, ref=default_branch)
         except Exception as exc:
             logger.warning("Could not fetch test file %s: %s", path, exc)
 
-    # ── 5. Rank source files by relevance to the ticket ────────────────
+    skipped_tests = len(test_paths) - len(test_files)
+    if skipped_tests > 0:
+        logger.info(
+            "Skipped %d lower-relevance test file(s) to preserve context budget.",
+            skipped_tests,
+        )
+
+    # ── 6. Rank source files by relevance to the ticket ────────────────
     # Issue 8 fix: Always run symbol extraction + LLM ranking regardless of
     # repo size. The old "<= 30 files → send everything" path caused the LLM
     # to receive all files with zero filtering, burning token budget and
     # confusing it with irrelevant files.
-    ticket_text = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
-    symbols = extract_symbols_from_text(ticket_text)
-    if symbols:
-        logger.info("Extracted %d symbols from ticket: %s", len(symbols), symbols[:15])
+    #
+    # S1-5: Track the LLM-selected set before any padding is applied.
+    try:
+        if len(source_paths) <= 10:
+            # Very small repos: take all files but still sort by symbol relevance.
+            relevant_paths = _sort_by_symbol_relevance(source_paths, symbols)
+            # For tiny repos every file is "LLM-equivalent" — no padding needed.
+            llm_selected_paths: list[str] = list(relevant_paths)
+        else:
+            logger.info(
+                "Running symbol scan + LLM ranking on %d source file(s)…", len(source_paths)
+            )
+            # S1-1 FIX: pass gitlab + branch so the ranking call can read file
+            # content snippets and make content-aware decisions.
+            relevant_paths, llm_selected_paths = _rank_relevant_files(
+                llm, ticket, source_paths,
+                gitlab=gitlab,
+                branch=default_branch,
+                max_files=30,
+                symbols=symbols,
+                audit=audit,
+            )
 
-    if len(source_paths) <= 10:
-        # Very small repos: take all files but still sort by symbol relevance.
-        relevant_paths = _sort_by_symbol_relevance(source_paths, symbols)
-    else:
-        logger.info(
-            "Running symbol scan + LLM ranking on %d source file(s)…", len(source_paths)
+        logger.info("Fetching %d relevant source file(s)…", len(relevant_paths))
+        # Issue 9 fix: Preserve relevance order when building the dict.
+        # downstream [:15] slices now get the TOP-ranked files, not the
+        # alphabetically-first files.
+        #
+        # S1-1 FIX: Use the content cache populated by _build_snippet_index to
+        # avoid re-fetching files that were already read during ranking.
+        source_files: dict[str, str] = {}
+        for path in relevant_paths:
+            if path in _snippet_content_cache:
+                source_files[path] = _snippet_content_cache[path]
+            else:
+                try:
+                    source_files[path] = gitlab.get_file_content(path, ref=default_branch)
+                except Exception as exc:
+                    logger.warning("Could not fetch source file %s: %s", path, exc)
+
+        # ── 7. Build context and update checkpoint ─────────────────────────
+        context = TicketContext(
+            ticket=ticket,
+            default_branch=default_branch,
+            source_files=source_files,
+            test_files=test_files,
+            all_file_paths=all_paths,
+            llm_selected_paths=llm_selected_paths,  # S1-5
         )
-        relevant_paths = _rank_relevant_files(
-            llm, ticket, source_paths, max_files=30,
+
+        if checkpoint.current_stage < 2:
+            checkpoint.current_stage = 2
+
+        # S1-5 FIX: emit LLM-selected vs symbol-padded split in the audit log.
+        audit.log(
+            stage=1,
+            event_type="stage1_complete",
+            payload={
+                "source_file_count": len(source_files),
+                "llm_selected_count": len(llm_selected_paths),
+                "symbol_padded_count": len(source_files) - len(llm_selected_paths),
+                "test_file_count": len(test_files),
+                "total_files": len(all_paths),
+                "repo_id": checkpoint.repo_id,
+            },
         )
-
-    logger.info("Fetching %d relevant source file(s)…", len(relevant_paths))
-    # Issue 9 fix: Preserve relevance order when building the dict.
-    # downstream [:15] slices now get the TOP-ranked files, not the
-    # alphabetically-first files.
-    source_files: dict[str, str] = {}
-    for path in relevant_paths:
-        try:
-            source_files[path] = gitlab.get_file_content(path, ref=default_branch)
-        except Exception as exc:
-            logger.warning("Could not fetch source file %s: %s", path, exc)
-
-    # ── 6. Build context and update checkpoint ─────────────────────────
-    context = TicketContext(
-        ticket=ticket,
-        default_branch=default_branch,
-        source_files=source_files,
-        test_files=test_files,
-        all_file_paths=all_paths,
-    )
-
-    if checkpoint.current_stage < 2:
-        checkpoint.current_stage = 2
-    audit.log(
-        stage=1,
-        event_type="stage1_complete",
-        payload={
-            "source_file_count": len(source_files),
-            "test_file_count": len(test_files),
-            "total_files": len(all_paths),
-            "repo_id": checkpoint.repo_id,
-        },
-    )
-    logger.info("Stage 1 complete for %s", ticket_id)
-    return context
+        logger.info("Stage 1 complete for %s", ticket_id)
+        return context
+    finally:
+        # Clear cache once fetching is done (or on failure) to free memory.
+        _snippet_content_cache.clear()
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 
 def _is_test_file(path: str) -> bool:
-    """Check whether *path* matches any JS/TS test-file glob."""
+    """Check whether *path* matches any known test-file glob (all languages)."""
     basename = path.rsplit("/", 1)[-1] if "/" in path else path
     return any(fnmatch.fnmatch(basename, pat) for pat in _TEST_PATTERNS)
 
 
 def _is_source_file(path: str) -> bool:
-    """Check whether *path* is a JS/TS source file (not a config/asset)."""
+    """Check whether *path* is a recognized source file (multi-language)."""
     basename = path.rsplit("/", 1)[-1] if "/" in path else path
     return any(fnmatch.fnmatch(basename, pat) for pat in _SOURCE_EXTENSIONS)
 
@@ -309,22 +493,111 @@ def _sort_by_symbol_relevance(paths: list[str], symbols: list[str]) -> list[str]
 
 
 
+# ---------------------------------------------------------------------------
+# S1-1 FIX — Content-snippet index builder
+# ---------------------------------------------------------------------------
+
+def _build_snippet_index(
+    paths: list[str],
+    symbols: list[str],
+    gitlab: Any,
+    branch: str,
+    max_files_to_read: int = 60,
+    max_snippet_lines: int = 8,
+) -> dict[str, str]:
+    """
+    For each candidate path (up to *max_files_to_read*), fetch file content
+    via the VCS API and extract a short snippet.  If a symbol from the ticket
+    appears in the file, the snippet is anchored around that hit.  Otherwise,
+    the first *max_snippet_lines* lines are returned as a generic preview.
+
+    As a side-effect, populates ``_snippet_content_cache`` with the **full**
+    file content so the subsequent source-file fetch loop in ``run()`` can
+    reuse it without an extra API round-trip.
+
+    Returns
+    -------
+    dict[str, str]
+        ``{path: snippet_text}``
+    """
+    snippets: dict[str, str] = {}
+    symbols_lower = [s.lower() for s in symbols]
+
+    # Prioritize candidate files whose paths contain extracted symbols so that
+    # the reading budget is spent on high-probability files rather than
+    # purely alphabetical prefixes.
+    candidate_paths = _sort_by_symbol_relevance(paths, symbols)[:max_files_to_read]
+
+    for path in candidate_paths:
+        try:
+            content = gitlab.get_file_content(path, ref=branch)
+        except Exception:
+            continue
+
+        # Cache full content for reuse in the source-file fetch loop.
+        _snippet_content_cache[path] = content
+
+        lines = content.splitlines()
+        if symbols_lower:
+            hit_lines = [
+                (i, line) for i, line in enumerate(lines, 1)
+                if any(sym in line.lower() for sym in symbols_lower)
+            ]
+        else:
+            hit_lines = []
+
+        if hit_lines:
+            first_hit_lineno = hit_lines[0][0]
+            start = max(0, first_hit_lineno - 2)
+            end = min(len(lines), first_hit_lineno + max_snippet_lines)
+            snippet = "\n".join(lines[start:end])
+            snippets[path] = f"[Lines {start + 1}-{end}]\n{snippet}"
+        else:
+            snippets[path] = "\n".join(lines[:max_snippet_lines])
+
+    return snippets
+
+
+# ---------------------------------------------------------------------------
+# S1-1 + S1-2 + S1-5 FIX — Enriched LLM ranking with content previews,
+# symbol-scored padding, low-confidence warning, and pre-padding tracking.
+# ---------------------------------------------------------------------------
+
 def _rank_relevant_files(
     llm: LLMClient,
     ticket: TicketData,
     paths: list[str],
+    gitlab: Any,
+    branch: str,
     max_files: int = 30,
-) -> list[str]:
+    symbols: list[str] | None = None,
+    audit: Any = None,
+) -> tuple[list[str], list[str]]:
     """
     Use the LLM to pick the most relevant source files for the ticket.
 
-    Sends a lightweight prompt with the file list and ticket summary;
-    asks the model to return the top-N most likely relevant paths.
-    The prompt is enriched with extracted symbols from the ticket text
-    to help the LLM make better relevance decisions (Phase 2).
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        ``(final_paths, llm_selected_paths)`` where *llm_selected_paths* is
+        the subset returned directly by the LLM (before any symbol-scored
+        padding) and *final_paths* is the padded list ready for fetching.
+
+    Changes vs. original
+    --------------------
+    * S1-1: Builds a content-snippet index via ``_build_snippet_index()`` and
+      injects file previews into the ranking prompt so the LLM can make
+      content-aware decisions, not just filename-based guesses.
+    * S1-2: Replaces alphabetical padding with symbol-scored fallback and
+      emits a low-confidence warning when the LLM returns fewer than
+      ``_LLM_MIN_RETURN_THRESHOLD`` files.
+    * S1-5: Returns the pre-padding LLM selection as a second value so
+      ``run()`` can store it in ``TicketContext.llm_selected_paths``.
     """
     ticket_text = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
-    symbols = extract_symbols_from_text(ticket_text)
+    if symbols is None:
+        symbols = extract_symbols_from_text(ticket_text)
+
     symbol_hint = ""
     if symbols:
         symbol_hint = (
@@ -333,25 +606,38 @@ def _rank_relevant_files(
             f"Give higher priority to files that contain these symbols.\n"
         )
 
-    paths_text = "\n".join(paths)
+    # S1-1: Build content snippet index (pre-fetches up to 60 files).
+    snippet_index = _build_snippet_index(paths, symbols, gitlab, branch)
+
+    # Build the paths block — inject previews where available.
+    paths_text_lines = []
+    for p in paths:
+        if p in snippet_index:
+            preview = snippet_index[p][:300].replace("\n", "\n    ")
+            paths_text_lines.append(f"{p}\n    Preview:\n    {preview}")
+        else:
+            paths_text_lines.append(p)
+    paths_text = "\n\n".join(paths_text_lines)
+
     prompt = (
-        "You are a code analysis assistant.  Given the following ticket "
-        "and a list of file paths in a repository, "
-        "return the paths most likely to need changes to resolve this ticket.\n\n"
+        "You are a code analysis assistant. Given the following ticket "
+        "and a list of repository files with content previews, "
+        "return the file paths most likely to need changes to resolve this ticket.\n\n"
         f"## Ticket\n"
         f"**Summary:** {ticket.summary}\n"
         f"**Description:** {ticket.description}\n"
         f"**Acceptance Criteria:** {ticket.acceptance_criteria}\n\n"
         f"{symbol_hint}"
-        f"## File Paths\n```\n{paths_text}\n```\n\n"
-        f"Return up to {max_files} file paths, one per line, no numbering, "
-        f"no explanation.  Only return paths from the list above."
+        f"## File Paths and Previews\n```\n{paths_text}\n```\n\n"
+        f"Return up to {max_files} file paths, one per line, ranked most-to-least "
+        f"relevant. Prioritize files whose preview content directly relates to the "
+        f"ticket. No explanation, no numbering, only paths from the list above."
     )
 
     response = llm.chat(
         prompt,
         stage=1,
-        call_purpose="Rank relevant source files",
+        call_purpose="Rank relevant source files (content-aware)",
         attached_files=paths,
     )
     content = response.get("content", "")
@@ -365,16 +651,51 @@ def _rank_relevant_files(
         if len(selected) >= max_files:
             break
 
-    # If the LLM returned too few, pad with the original list.
+    # Track the LLM-returned subset before any padding (S1-5).
+    llm_selected = list(selected)
+
+    # S1-2 FIX: emit low-confidence warning when the LLM returns too few files.
+    # Avoid false-positive warning if repository has fewer files than the threshold.
+    min_expected = min(_LLM_MIN_RETURN_THRESHOLD, len(paths))
+    if len(llm_selected) < min_expected:
+        logger.warning(
+            "LLM returned only %d file(s) (expected at least %d) — possible poor "
+            "ticket description or ambiguous file tree. Results may be inaccurate.",
+            len(llm_selected),
+            min_expected,
+        )
+        if audit is not None:
+            try:
+                audit.log(
+                    stage=1,
+                    event_type="ranking_low_confidence",
+                    payload={
+                        "llm_selected": len(llm_selected),
+                        "total_candidates": len(paths),
+                    },
+                )
+            except Exception:  # never let audit failures break the pipeline
+                pass
+
+    # S1-2 FIX: pad with symbol-scored fallback instead of alphabetical order.
     if len(selected) < max_files:
-        for p in paths:
-            if p not in selected:
-                selected.append(p)
+        remaining = [p for p in paths if p not in set(selected)]
+        scored_remaining = _sort_by_symbol_relevance(remaining, symbols)
+        original_count = len(selected)
+        for p in scored_remaining:
+            selected.append(p)
             if len(selected) >= max_files:
                 break
+        padded_count = len(selected) - original_count
+        if padded_count > 0:
+            logger.info(
+                "LLM returned %d file(s); padded %d more using symbol-scored fallback.",
+                original_count,
+                padded_count,
+            )
 
     logger.info("LLM ranked %d relevant files from %d candidates", len(selected), len(paths))
-    return selected
+    return selected, llm_selected
 
 
 def refresh_context_for_feedback(

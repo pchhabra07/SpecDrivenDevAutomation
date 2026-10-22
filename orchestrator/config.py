@@ -102,7 +102,7 @@ class Settings(BaseSettings):
         description="Minimum Jest line-coverage percentage",
     )
 
-    # ── CI/CD pipeline polling ─────────────────────────────────────────
+    # ── CI/CD pipeline polling & Stage 4 validation ───────────────────
     ci_poll_interval_seconds: int = Field(
         30,
         description="Seconds between CI pipeline status polls",
@@ -110,6 +110,14 @@ class Settings(BaseSettings):
     ci_timeout_minutes: int = Field(
         30,
         description="Max minutes to wait for a CI pipeline run",
+    )
+    max_stage4_repair_attempts: int = Field(
+        1,
+        description="Maximum LLM repair attempts for Stage 4 gate failures before escalating",
+    )
+    reuse_stage3_final_pipeline: bool = Field(
+        True,
+        description="Reuse Stage 3 final full CI pipeline result in Stage 4 to avoid duplicate runs",
     )
 
     # ── SonarQube ──────────────────────────────────────────────────────
@@ -178,6 +186,29 @@ class Settings(BaseSettings):
     max_context_tokens: int = Field(
         131072,
         description="Maximum estimated token threshold before older iterations are summarized",
+    )
+
+    # ── Stage 1 context limits (S1-4 fix) ─────────────────────────────
+    max_context_test_files: int = Field(
+        10,
+        description=(
+            "Maximum number of existing test files to include in the Stage 1 context. "
+            "Test files are sorted by symbol relevance before this cap is applied."
+        ),
+    )
+
+    # ── Stage 2 settings (S2-1, S2-4, S2-5 fixes) ────────────────────
+    max_gate1_revision_cycles: int = Field(
+        5,
+        description="Maximum Gate 1 test-revision cycles before pipeline aborts",
+    )
+    test_preflight_max_repairs: int = Field(
+        2,
+        description="Maximum preflight repair attempts for generated tests in Stage 2",
+    )
+    blocking_gates: bool = Field(
+        True,
+        description="Wait synchronously for human gates (for CLI/dev use; set False for non-blocking server/webhook mode)",
     )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

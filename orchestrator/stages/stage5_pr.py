@@ -19,12 +19,19 @@ Implements FR-17 through FR-21.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
-from orchestrator.gitlab_gate import GateOutcome, GateResult, wait_for_approval
+from orchestrator.exceptions import GatePendingError
+from orchestrator.gitlab_gate import (
+    GateOutcome,
+    GateResult,
+    check_approval_once,
+    wait_for_approval,
+)
 from orchestrator.notifier import (
     notify_feedback_received,
     notify_gate2_approved,
@@ -130,29 +137,22 @@ def run(
     gate_timeout_hours: float = 48.0,
     slack_webhook_url: str = "",
     escalation_email: str = "",
+    blocking_gate: bool = True,
+    checkpoint_dir: str = ".checkpoints",
 ) -> Stage5Result:
     """
     Execute Stage 5: promote draft PR, sync ticket state, notify reviewers, and wait
-    for Gate 2 approval or reviewer feedback.
+    for Gate 2 approval or reviewer feedback. Supports non-blocking gate suspension (S5-1).
     """
     audit.log(stage=5, event_type="stage5_start")
     mr_iid = checkpoint.draft_mr_iid
     if mr_iid is None:
         raise ValueError("Cannot run Stage 5: draft_mr_iid is not set in checkpoint.")
 
-    # ── 1. Promote draft PR to ready-for-review ──────────────────────────
-    logger.info("Promoting PR #%s to ready-for-review…", mr_iid)
-    gitlab.promote_mr_to_ready(mr_iid)
-    gitlab.add_mr_label(mr_iid, "ready-for-review")
-    gitlab.add_mr_label(mr_iid, "spec-driven-dev")
-
-    # ── 2. Update PR description with full report ────────────────────────
-    logger.info("Updating PR description with validation report…")
-    description = _build_mr_description(context, validation_result, checkpoint)
-    gitlab.update_mr_description(mr_iid, description)
-    audit.log(stage=5, event_type="stage5_mr_promoted", payload={"mr_iid": mr_iid})
-
-    if hasattr(gitlab, "_project"):
+    # Canonical PR URL lookup (S5-2)
+    if hasattr(gitlab, "get_pr_url"):
+        mr_url = gitlab.get_pr_url(mr_iid)
+    elif hasattr(gitlab, "_project"):
         mr_url = f"{gitlab._project.web_url}/-/merge_requests/{mr_iid}"
     elif hasattr(gitlab, "_repo"):
         mr_url = f"{gitlab._repo.html_url}/pull/{mr_iid}"
@@ -162,37 +162,67 @@ def run(
     checkpoint.final_mr_url = mr_url
     checkpoint.gate2_mr_iid = mr_iid
 
-    # ── 3. Ticket Synchronization ─────────────────────────────────────────
-    logger.info("Synchronizing ticket status to review…")
-    jira.transition_ticket(
-        ticket_id,
-        ["Under Review", "In Review", "Ready for Review", "In Progress"],
+    # Idempotency guard (Edge Case 1): Only promote PR, post Jira lifecycle comment,
+    # and send reviewer notifications once per iteration cycle
+    already_promoted = (
+        checkpoint.gate2_promoted_iteration is not None
+        and checkpoint.gate2_promoted_iteration == checkpoint.iteration_count
     )
+
     gates_summary = "\n".join(
         f"- {g.name}: {'PASS' if g.passed else g.status}" for g in validation_result.gates
     )
-    jira.post_lifecycle_comment(
-        ticket_id=ticket_id,
-        title="Gate 2 — Ready for Review",
-        message=(
-            f"Code generation and all 5 CI validation gates completed successfully!\n\n"
-            f"*Validation Summary:*\n{gates_summary}\n\n"
-            f"Please review the PR diffs and approve."
-        ),
-        mr_url=mr_url,
-    )
 
-    # ── 4. Reviewer Notifications ────────────────────────────────────────
-    notify_gate2_pending(
-        slack_webhook_url=slack_webhook_url,
-        escalation_email=escalation_email,
-        ticket_id=ticket_id,
-        mr_url=mr_url,
-        gate_results_summary=gates_summary,
-    )
+    if not already_promoted:
+        # ── 1. Promote draft PR to ready-for-review ──────────────────────────
+        logger.info("Promoting PR #%s to ready-for-review…", mr_iid)
+        gitlab.promote_mr_to_ready(mr_iid)
+        gitlab.add_mr_label(mr_iid, "ready-for-review")
+        gitlab.add_mr_label(mr_iid, "spec-driven-dev")
 
-    # ── 5. Gate 2 Human Approval Monitoring Loop ─────────────────────────
-    logger.info("Waiting for Gate 2 Human Approval (PR #%s)…", mr_iid)
+        # ── 2. Update PR description with full report ────────────────────────
+        logger.info("Updating PR description with validation report…")
+        description = _build_mr_description(context, validation_result, checkpoint)
+        gitlab.update_mr_description(mr_iid, description)
+        audit.log(stage=5, event_type="stage5_mr_promoted", payload={"mr_iid": mr_iid})
+
+        # ── 3. Ticket Synchronization ─────────────────────────────────────────
+        logger.info("Synchronizing ticket status to review…")
+        jira.transition_ticket(
+            ticket_id,
+            ["Under Review", "In Review", "Ready for Review", "In Progress"],
+        )
+        jira.post_lifecycle_comment(
+            ticket_id=ticket_id,
+            title="Gate 2 — Ready for Review",
+            message=(
+                f"Code generation and all 5 CI validation gates completed successfully!\n\n"
+                f"*Validation Summary:*\n{gates_summary}\n\n"
+                f"Please review the PR diffs and approve."
+            ),
+            mr_url=mr_url,
+        )
+
+        # ── 4. Reviewer Notifications ────────────────────────────────────────
+        notify_gate2_pending(
+            slack_webhook_url=slack_webhook_url,
+            escalation_email=escalation_email,
+            ticket_id=ticket_id,
+            mr_url=mr_url,
+            gate_results_summary=gates_summary,
+        )
+
+        checkpoint.gate2_promoted_iteration = checkpoint.iteration_count
+        checkpoint.save(checkpoint_dir)
+    else:
+        logger.info(
+            "PR #%s was already promoted for iteration %d; skipping duplicate notifications.",
+            mr_iid,
+            checkpoint.iteration_count,
+        )
+
+    # ── 5. Gate 2 Human Approval Check / Monitoring Loop ─────────────────
+    logger.info("Checking Gate 2 Human Approval (PR #%s)…", mr_iid)
     seen_comments: set[str] = set()
 
     # Pre-seed seen_comments with any comments already present on the PR
@@ -207,14 +237,59 @@ def run(
             if b:
                 seen_comments.add(b)
 
-    gate_result: GateResult = wait_for_approval(
-        gitlab=gitlab,
-        mr_iid=mr_iid,
-        poll_interval_seconds=gate_poll_interval,
-        timeout_hours=gate_timeout_hours,
-        return_on_changes_requested=True,
-        seen_comments=seen_comments,
-    )
+    if not blocking_gate:
+        # Non-blocking Gate 2 check (S5-1)
+        # Check for stale gate timeout if previously suspended (Edge Case 2)
+        if checkpoint.gate_waiting_since:
+            elapsed_hours = (time.time() - checkpoint.gate_waiting_since) / 3600.0
+            if elapsed_hours >= gate_timeout_hours:
+                logger.error(
+                    "Gate 2 timed out after %.1f hours for PR #%d (timeout=%.1fh)",
+                    elapsed_hours, mr_iid, gate_timeout_hours,
+                )
+                checkpoint.gate_waiting = None
+                checkpoint.gate_waiting_mr_iid = None
+                checkpoint.gate_waiting_since = None
+                checkpoint.save(checkpoint_dir)
+                return Stage5Result(
+                    mr_iid=mr_iid,
+                    mr_url=mr_url,
+                    status="timeout",
+                )
+
+        gate_result: GateResult = check_approval_once(
+            gitlab=gitlab,
+            mr_iid=mr_iid,
+            seen_comments=seen_comments,
+        )
+
+        if gate_result.outcome == GateOutcome.PENDING:
+            checkpoint.gate_waiting = "gate2"
+            checkpoint.gate_waiting_mr_iid = mr_iid
+            if not checkpoint.gate_waiting_since:
+                checkpoint.gate_waiting_since = time.time()
+            checkpoint.current_stage = 5
+            checkpoint.save(checkpoint_dir)
+            logger.info(
+                "Gate 2 pending for PR #%d. Pipeline suspended cleanly. "
+                "Will resume automatically when PR review webhook triggers.",
+                mr_iid,
+            )
+            raise GatePendingError("gate2", mr_iid)
+    else:
+        gate_result = wait_for_approval(
+            gitlab=gitlab,
+            mr_iid=mr_iid,
+            poll_interval_seconds=gate_poll_interval,
+            timeout_hours=gate_timeout_hours,
+            return_on_changes_requested=True,
+            seen_comments=seen_comments,
+        )
+
+    # Decision reached — clear gate_waiting state
+    checkpoint.gate_waiting = None
+    checkpoint.gate_waiting_mr_iid = None
+    checkpoint.gate_waiting_since = None
 
     if gate_result.outcome == GateOutcome.APPROVED:
         logger.info("Gate 2 APPROVED for %s by %s", ticket_id, ", ".join(gate_result.approved_by))
@@ -225,6 +300,7 @@ def run(
         )
         checkpoint.gate2_approved = True
         checkpoint.current_stage = 5
+        checkpoint.save(checkpoint_dir)
 
         # Update ticket to Approved / Ready to Merge
         jira.transition_ticket(
@@ -261,20 +337,24 @@ def run(
         )
 
     # ── Path B: Reviewer requested changes (FR-21) ───────────────────────
-    logger.warning("Gate 2 feedback received on PR #%s: %d comment(s)", mr_iid, len(gate_result.reviewer_comments))
+    feedback = gate_result.reviewer_comments or ["Reviewer requested changes on pull request."]
+    logger.warning("Gate 2 feedback received on PR #%s: %d comment(s)", mr_iid, len(feedback))
     audit.log(
         stage=5,
         event_type="gate2_changes_requested",
-        payload={"mr_iid": mr_iid, "comments": gate_result.reviewer_comments},
+        payload={"mr_iid": mr_iid, "comments": feedback},
     )
     gitlab.add_mr_label(mr_iid, "changes-requested")
-    checkpoint.reviewer_feedback = gate_result.reviewer_comments
+    checkpoint.reviewer_feedback = feedback
+    # Reset promotion tracker so next iteration's promotion will update description & notify
+    checkpoint.gate2_promoted_iteration = None
+    checkpoint.save(checkpoint_dir)
 
     jira.transition_ticket(
         ticket_id,
         ["In Progress", "Start Progress"],
     )
-    comments_preview = "\n- ".join(gate_result.reviewer_comments[:3])
+    comments_preview = "\n- ".join(feedback[:3])
     jira.post_lifecycle_comment(
         ticket_id=ticket_id,
         title="Reviewer Feedback Received",
@@ -289,13 +369,13 @@ def run(
         escalation_email=escalation_email,
         ticket_id=ticket_id,
         mr_url=mr_url,
-        feedback_notes=gate_result.reviewer_comments,
+        feedback_notes=feedback,
     )
 
     return Stage5Result(
         mr_iid=mr_iid,
         mr_url=mr_url,
         status="changes_requested",
-        reviewer_feedback=gate_result.reviewer_comments,
+        reviewer_feedback=feedback,
     )
 

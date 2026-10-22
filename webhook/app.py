@@ -13,9 +13,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
@@ -47,9 +49,43 @@ def _cleanup_old_dedup_entries() -> None:
         del _recent_events[k]
 
 
+async def _stale_gate_monitor(poll_interval: float = 3600.0) -> None:
+    """Periodically re-enqueue tickets whose gate wait has timed out (S5-1)."""
+    while True:
+        try:
+            await asyncio.sleep(poll_interval)
+            settings = get_settings()
+            checkpoint_dir = Path(settings.checkpoint_dir)
+            if not checkpoint_dir.exists():
+                continue
+            timeout_seconds = settings.gate_timeout_hours * 3600
+            now = time.time()
+            for fname in checkpoint_dir.glob("*.json"):
+                try:
+                    data = json.loads(fname.read_text(encoding="utf-8"))
+                    if data.get("gate_waiting") and data.get("gate_waiting_since"):
+                        elapsed = now - float(data["gate_waiting_since"])
+                        if elapsed > timeout_seconds:
+                            ticket_id = data.get("ticket_id")
+                            if ticket_id:
+                                logger.warning(
+                                    "Gate timeout for ticket %s (gate=%s, elapsed=%.1fh). Re-enqueuing.",
+                                    ticket_id,
+                                    data["gate_waiting"],
+                                    elapsed / 3600,
+                                )
+                                await task_queue.put(str(ticket_id))
+                except Exception:
+                    continue
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("Error in stale-gate monitor loop: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager: launch the concurrent worker pool on startup."""
+    """Lifecycle manager: launch the concurrent worker pool and stale-gate monitor on startup."""
     global worker_pool
     # Unconditionally silence low-level HTTP transport and wire dumps
     for noisy in (
@@ -69,6 +105,8 @@ async def lifespan(app: FastAPI):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     settings = get_settings()
+    # In server/webhook mode, gates must not block worker threads (S2-1, S5-1)
+    settings.blocking_gates = False
     worker_pool = ConcurrentWorkerPool(
         queue=task_queue,
         pipeline_runner=run_pipeline,
@@ -76,7 +114,13 @@ async def lifespan(app: FastAPI):
     )
     worker_pool.start()
     logger.info("Webhook service initialized with %d workers.", settings.max_concurrent_tickets)
+    stale_monitor_task = asyncio.create_task(_stale_gate_monitor())
     yield
+    stale_monitor_task.cancel()
+    try:
+        await stale_monitor_task
+    except asyncio.CancelledError:
+        pass
     if worker_pool:
         await worker_pool.stop()
     logger.info("Webhook service shut down.")
@@ -194,6 +238,30 @@ async def handle_jira_webhook(
     }
 
 
+def _find_ticket_for_pr(pr_number: int, checkpoint_dir: str) -> str | None:
+    """Scan checkpoint files to find a ticket waiting on the given PR/MR number (S2-1)."""
+    import json
+    from pathlib import Path
+
+    cp_dir = Path(checkpoint_dir)
+    if not cp_dir.is_dir():
+        return None
+
+    for fname in cp_dir.glob("*.json"):
+        try:
+            data = json.loads(fname.read_text(encoding="utf-8"))
+            if (
+                data.get("gate_waiting_mr_iid") == pr_number
+                or data.get("gate1_mr_iid") == pr_number
+                or data.get("gate2_mr_iid") == pr_number
+                or data.get("draft_mr_iid") == pr_number
+            ):
+                return str(data.get("ticket_id"))
+        except Exception:
+            continue
+    return None
+
+
 @app.post("/webhooks/github", status_code=status.HTTP_202_ACCEPTED)
 async def handle_github_webhook(
     request: Request,
@@ -223,6 +291,70 @@ async def handle_github_webhook(
     # If ping event
     if x_github_event == "ping":
         return {"status": "pong"}
+
+    # S2-1: Handle pull_request_review events (e.g. human approved or requested changes)
+    if x_github_event == "pull_request_review":
+        action = payload.get("action", "")
+        pr = payload.get("pull_request", {})
+        pr_number = pr.get("number")
+        if action in ("submitted", "dismissed", "edited") and pr_number:
+            review_id = payload.get("review", {}).get("id", "")
+            dedup_key = f"github_review:{pr_number}:{action}:{review_id}"
+            _cleanup_old_dedup_entries()
+            if dedup_key in _recent_events:
+                logger.info("Ignoring duplicate review webhook for PR #%s", pr_number)
+                return {"status": "duplicate_ignored", "pr_number": pr_number}
+            _recent_events[dedup_key] = time.time()
+
+            ticket_id = _find_ticket_for_pr(pr_number, settings.checkpoint_dir)
+            if ticket_id:
+                await task_queue.put(ticket_id)
+                queue_pos = task_queue.qsize()
+                logger.info(
+                    "Re-enqueued ticket %s after PR #%d review event (queue position: %d)",
+                    ticket_id, pr_number, queue_pos,
+                )
+                return {
+                    "status": "requeued",
+                    "ticket_id": ticket_id,
+                    "pr_number": pr_number,
+                    "queue_position": queue_pos,
+                }
+            logger.info("No checkpoint found waiting for PR #%d", pr_number)
+            return {"status": "ignored", "reason": "no_matching_checkpoint"}
+        return {"status": "ignored", "reason": f"unhandled_review_action_{action}"}
+
+    # S2-1: Handle issue_comment events on pull requests (e.g. reviewer commented on PR)
+    if x_github_event == "issue_comment" and payload.get("issue", {}).get("pull_request"):
+        action = payload.get("action", "")
+        comment = payload.get("comment", {})
+        body = comment.get("body", "")
+        if "<!-- spec-driven-bot -->" in body or "[spec-driven]" in body:
+            return {"status": "ignored", "reason": "bot_comment"}
+        pr_number = payload.get("issue", {}).get("number")
+        if action == "created" and pr_number:
+            comment_id = comment.get("id", "")
+            dedup_key = f"github_comment:{pr_number}:{comment_id}"
+            _cleanup_old_dedup_entries()
+            if dedup_key in _recent_events:
+                return {"status": "duplicate_ignored", "pr_number": pr_number}
+            _recent_events[dedup_key] = time.time()
+
+            ticket_id = _find_ticket_for_pr(pr_number, settings.checkpoint_dir)
+            if ticket_id:
+                await task_queue.put(ticket_id)
+                queue_pos = task_queue.qsize()
+                logger.info(
+                    "Re-enqueued ticket %s after PR #%d comment event (queue position: %d)",
+                    ticket_id, pr_number, queue_pos,
+                )
+                return {
+                    "status": "requeued",
+                    "ticket_id": ticket_id,
+                    "pr_number": pr_number,
+                    "queue_position": queue_pos,
+                }
+            return {"status": "ignored", "reason": "no_matching_checkpoint"}
 
     # Filter for 'issues' event
     if x_github_event and x_github_event != "issues":
@@ -280,9 +412,9 @@ async def handle_github_webhook(
 async def handle_gitlab_webhook(
     request: Request,
     x_gitlab_token: str | None = Header(None, alias="X-Gitlab-Token"),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """
-    GitLab webhook endpoint for MR updates and approval events.
+    GitLab webhook endpoint for MR updates and approval events (S2-1).
     """
     settings = get_settings()
     if settings.gitlab_webhook_secret and x_gitlab_token != settings.gitlab_webhook_secret:
@@ -291,7 +423,32 @@ async def handle_gitlab_webhook(
     payload = await request.json()
     object_kind = payload.get("object_kind")
     logger.info("Received GitLab webhook: %s", object_kind)
-    return {"status": "received"}
+
+    # Re-enqueue ticket waiting on MR approval or feedback
+    if object_kind in ("merge_request", "note"):
+        mr = payload.get("merge_request", {}) or payload.get("object_attributes", {})
+        mr_iid = mr.get("iid") or payload.get("merge_request", {}).get("iid")
+        if mr_iid:
+            note_body = payload.get("object_attributes", {}).get("note", "")
+            if "<!-- spec-driven-bot -->" in note_body or "[spec-driven]" in note_body:
+                return {"status": "ignored", "reason": "bot_comment"}
+
+            ticket_id = _find_ticket_for_pr(int(mr_iid), settings.checkpoint_dir)
+            if ticket_id:
+                await task_queue.put(ticket_id)
+                queue_pos = task_queue.qsize()
+                logger.info(
+                    "Re-enqueued ticket %s after GitLab MR/Note event for MR !%s (queue position: %d)",
+                    ticket_id, mr_iid, queue_pos,
+                )
+                return {
+                    "status": "requeued",
+                    "ticket_id": ticket_id,
+                    "mr_iid": mr_iid,
+                    "queue_position": queue_pos,
+                }
+
+    return {"status": "received", "event": object_kind}
 
 
 @app.get("/health")

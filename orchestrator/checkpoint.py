@@ -45,12 +45,27 @@ class Checkpoint:
     final_mr_url: str = ""
     repo_id: str | int | None = None
     ci_workflow_path: str = ""
+    # S2-1: Non-blocking gate suspension fields
+    gate_waiting: str | None = None          # None | "gate1" | "gate2"
+    gate_waiting_mr_iid: int | None = None   # PR/MR number currently awaiting review
+    gate_waiting_since: float | None = None  # Epoch timestamp when gate began waiting
+    gate1_revision_count: int = 0
+    generated_test_files: dict[str, str] = field(default_factory=dict)
+    # S3-5 & S3-6: Checkpoint self-contained directory and reviewer feedback history
+    checkpoint_dir: str = ".checkpoints"
+    reviewer_feedback_history: list[list[str]] = field(default_factory=list)
+    # S4-3: Reuse Stage 3 final full CI pipeline result in Stage 4
+    stage3_final_pipeline_result: dict[str, Any] = field(default_factory=dict)
+    # S5-1: Idempotency tracker for Stage 5 promotion/notification
+    gate2_promoted_iteration: int | None = None
 
     # ── Persistence ─────────────────────────────────────────────────────
 
-    def save(self, checkpoint_dir: str) -> Path:
+    def save(self, checkpoint_dir: str | None = None) -> Path:
         """Write current state to ``<checkpoint_dir>/<ticket_id>.json``."""
-        dirpath = Path(checkpoint_dir)
+        if checkpoint_dir is not None:
+            self.checkpoint_dir = checkpoint_dir
+        dirpath = Path(self.checkpoint_dir or ".checkpoints")
         dirpath.mkdir(parents=True, exist_ok=True)
         filepath = dirpath / f"{self.ticket_id}.json"
         tmp = filepath.with_suffix(".json.tmp")
@@ -62,7 +77,7 @@ class Checkpoint:
         return filepath
 
     @classmethod
-    def load(cls, ticket_id: str, checkpoint_dir: str) -> Checkpoint | None:
+    def load(cls, ticket_id: str, checkpoint_dir: str = ".checkpoints") -> Checkpoint | None:
         """Load a checkpoint from disk, or return *None* if none exists."""
         filepath = Path(checkpoint_dir) / f"{ticket_id}.json"
         if not filepath.exists():
@@ -71,7 +86,11 @@ class Checkpoint:
             data = json.load(fh)
         logger.info("Checkpoint loaded ← %s (stage=%s, iter=%s)",
                      filepath, data.get("current_stage"), data.get("iteration_count"))
-        return cls(**data)
+        valid_fields = cls.__dataclass_fields__
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        instance = cls(**filtered_data)
+        instance.checkpoint_dir = checkpoint_dir
+        return instance
 
     @staticmethod
     def delete(ticket_id: str, checkpoint_dir: str) -> None:

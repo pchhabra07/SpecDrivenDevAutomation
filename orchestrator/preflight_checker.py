@@ -6,6 +6,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import shutil
+import subprocess
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,6 +18,7 @@ class PreflightResult:
     passed: bool
     errors: list = field(default_factory=list)
     language: str = ""
+    confidence: str = "high"
 
     @property
     def error_summary(self) -> str:
@@ -37,7 +41,8 @@ def build_repair_prompt(results: list) -> str:
         "",
     ]
     for r in failed:
-        lines.append(f"FILE: {r.path} ({r.language})")
+        conf_note = " (heuristic check)" if r.confidence == "low" else ""
+        lines.append(f"FILE: {r.path} ({r.language}){conf_note}")
         for err in r.errors:
             lines.append(f"  ERROR: {err}")
         lines.append("")
@@ -49,7 +54,7 @@ def _check_file(path: str, content: str) -> PreflightResult:
     ext = Path(path).suffix.lower().lstrip(".")
     if ext == "py":
         return _check_python(path, content)
-    if ext in ("js", "ts", "jsx", "tsx"):
+    if ext in ("js", "ts", "jsx", "tsx", "mjs", "cjs"):
         return _check_js_ts(path, content)
     if ext in ("html", "htm"):
         return _check_html(path, content)
@@ -71,9 +76,57 @@ def _check_python(path: str, content: str) -> PreflightResult:
             errors=[f"SyntaxError on line {exc.lineno}: {exc.msg}"])
 
 
+def _looks_like_jsx(content: str) -> bool:
+    """Rough heuristic to detect JSX elements in JS files."""
+    return bool(re.search(r"<\s*([A-Z]\w+|div|span|p|button|a|input|form|table|ul|li)\b[^>]*>", content))
+
+
+def _run_node_syntax_check(content: str, is_module: bool = False) -> tuple[bool, str] | None:
+    """
+    Attempt real JavaScript syntax check using `node --check`.
+    Returns (passed, error_message) or None if Node is unavailable/timed out.
+    """
+    if not shutil.which("node"):
+        return None
+    cmd = ["node", "--check"]
+    if is_module:
+        cmd.append("--input-type=module")
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=content,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            return True, ""
+        err = proc.stderr.strip()
+        if not is_module and ("Cannot use import statement" in err or "Unexpected token 'export'" in err):
+            return _run_node_syntax_check(content, is_module=True)
+        err_lines = [l for l in err.splitlines() if l.strip() and not l.strip().startswith("at ")][:4]
+        return False, "\n".join(err_lines) or "Node syntax check failed"
+    except Exception as exc:
+        logger.debug("Node syntax check skipped: %s", exc)
+        return None
+
+
 def _check_js_ts(path: str, content: str) -> PreflightResult:
-    errors = []
     ext = Path(path).suffix.lower().lstrip(".")
+    is_pure_js = ext in ("js", "mjs", "cjs") and not _looks_like_jsx(content)
+
+    # Try Node.js syntax check for pure JS
+    if is_pure_js:
+        is_mod = (ext == "mjs") or bool(re.search(r"^\s*(import|export)\b", content, re.MULTILINE))
+        node_res = _run_node_syntax_check(content, is_module=is_mod)
+        if node_res is not None:
+            passed, err_msg = node_res
+            if not passed:
+                return PreflightResult(path=path, passed=False, language=ext, errors=[err_msg], confidence="high")
+            return PreflightResult(path=path, passed=True, language=ext, confidence="high")
+
+    # Fallback: heuristic bracket and backtick counting (confidence="low")
+    errors = []
     cleaned = _strip_js_comments(content)
     for oc, cc in [("{", "}"), ("(", ")"), ("[", "]")]:
         opens = cleaned.count(oc)
@@ -83,7 +136,8 @@ def _check_js_ts(path: str, content: str) -> PreflightResult:
     bt = cleaned.count("`")
     if bt % 2 != 0:
         errors.append(f"Odd backtick count ({bt}): possible unclosed template literal")
-    return PreflightResult(path=path, passed=not errors, language=ext, errors=errors)
+
+    return PreflightResult(path=path, passed=not errors, language=ext, errors=errors, confidence="low")
 
 
 def _strip_js_comments(text: str) -> str:
@@ -91,6 +145,7 @@ def _strip_js_comments(text: str) -> str:
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     text = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text)
     text = re.sub(r"'(?:[^'\\]|\\.)*'", "''", text)
+    text = re.sub(r"`(?:[^`\\]|\\.)*`", "``", text, flags=re.DOTALL)
     return text
 
 

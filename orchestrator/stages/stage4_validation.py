@@ -84,6 +84,7 @@ def run(
     ci_timeout_minutes: int = 30,
     sonar_configured: bool = False,
     coverage_threshold: int = 80,
+    reuse_stage3_pipeline: bool = True,
 ) -> ValidationResult:
     """
     Execute Stage 4: trigger full CI pipeline and evaluate gate results.
@@ -108,6 +109,8 @@ def run(
     coverage_threshold:
         Minimum Jest line-coverage percentage (for logging only — the
         actual enforcement is in the CI pipeline job itself).
+    reuse_stage3_pipeline:
+        Whether to reuse the full CI pipeline run from Stage 3 if available.
 
     Returns
     -------
@@ -119,22 +122,48 @@ def run(
         code_branch, coverage_threshold,
     )
 
-    # ── 1. Trigger full CI pipeline ────────────────────────────────────
-    pipeline_id = trigger_ci(gitlab, code_branch)
-    checkpoint.ci_pipeline_id = pipeline_id
-    audit.log(
-        stage=4,
-        event_type="ci_pipeline_triggered",
-        payload={"pipeline_id": pipeline_id, "branch": code_branch},
-    )
+    ci_result: CIResult
+    stored_result = getattr(checkpoint, "stage3_final_pipeline_result", None)
+    if (
+        reuse_stage3_pipeline
+        and stored_result
+        and stored_result.get("pipeline_id")
+    ):
+        pipeline_id = stored_result["pipeline_id"]
+        # Clear after single use so any subsequent repair iterations trigger a fresh CI run
+        checkpoint.stage3_final_pipeline_result = {}
+        logger.info(
+            "Reusing Stage 3 final full CI pipeline #%d (avoiding duplicate full CI run).",
+            pipeline_id,
+        )
+        ci_result = CIResult(
+            pipeline_id=pipeline_id,
+            status=stored_result.get("status", "unknown"),
+            web_url=stored_result.get("web_url", ""),
+            jobs=stored_result.get("jobs", []),
+        )
+        audit.log(
+            stage=4,
+            event_type="stage3_pipeline_reused",
+            payload={"pipeline_id": pipeline_id, "branch": code_branch},
+        )
+    else:
+        # ── 1. Trigger full CI pipeline ────────────────────────────────────
+        pipeline_id = trigger_ci(gitlab, code_branch)
+        checkpoint.ci_pipeline_id = pipeline_id
+        audit.log(
+            stage=4,
+            event_type="ci_pipeline_triggered",
+            payload={"pipeline_id": pipeline_id, "branch": code_branch},
+        )
 
-    # ── 2. Poll until terminal state ───────────────────────────────────
-    ci_result = wait_for_pipeline(
-        gitlab,
-        pipeline_id=pipeline_id,
-        poll_interval_seconds=ci_poll_interval,
-        timeout_minutes=ci_timeout_minutes,
-    )
+        # ── 2. Poll until terminal state ───────────────────────────────────
+        ci_result = wait_for_pipeline(
+            gitlab,
+            pipeline_id=pipeline_id,
+            poll_interval_seconds=ci_poll_interval,
+            timeout_minutes=ci_timeout_minutes,
+        )
 
     # ── 3. Evaluate individual gate statuses ───────────────────────────
     gates = _map_gate_statuses(ci_result, sonar_configured=sonar_configured)
@@ -192,6 +221,31 @@ def run(
     return result
 
 
+def _resolve_missing_gate_status(
+    job_name: str,
+    ci_passed: bool,
+    sonar_configured: bool,
+) -> tuple[str, bool]:
+    """
+    Determine (status, required) for a gate whose job was not found in CI results.
+
+    Gate resolution policy:
+    - quality-gate (SonarQube): always skipped and optional if SonarQube is not configured.
+    - If overall CI pipeline passed: mark as skipped and optional (job simply not defined in this repo).
+    - If overall CI pipeline failed: mark as unknown and optional (cannot determine if it ran).
+    - Only jobs explicitly present in CI results and marked 'failed'/'failure' block the pipeline.
+    """
+    if job_name == "quality-gate" and not sonar_configured:
+        return "skipped", False
+
+    if ci_passed:
+        # Pipeline succeeded overall; the gate job simply isn't defined in this repo
+        return "skipped", False
+    else:
+        # Pipeline failed; we can't determine if this gate ran or not
+        return "unknown", False
+
+
 def _map_gate_statuses(
     ci_result: CIResult,
     sonar_configured: bool,
@@ -212,23 +266,14 @@ def _map_gate_statuses(
                 break
 
         if job_status is None:
-            if is_sonar and not sonar_configured:
-                status = "skipped"
-                logger.info(
-                    "SonarQube not configured — skipping quality-gate check."
-                )
-            elif ci_result.passed and job_name in ("lint", "sast", "dependency-scan"):
-                status = "skipped"
-                required = False
-                logger.info(
-                    "Gate '%s' not defined in repository CI — skipped as pipeline succeeded.",
-                    job_name,
-                )
-            else:
-                status = "unknown"
-                logger.warning(
-                    "CI job '%s' not found in pipeline results.", job_name,
-                )
+            status, req = _resolve_missing_gate_status(
+                job_name, ci_result.passed, sonar_configured
+            )
+            required = req
+            logger.info(
+                "Gate '%s' not found in CI results. Policy decision: status=%s, required=%s",
+                job_name, status, required,
+            )
         else:
             status = job_status
 

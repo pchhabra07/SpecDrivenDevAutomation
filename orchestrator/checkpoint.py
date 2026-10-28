@@ -58,6 +58,10 @@ class Checkpoint:
     stage3_final_pipeline_result: dict[str, Any] = field(default_factory=dict)
     # S5-1: Idempotency tracker for Stage 5 promotion/notification
     gate2_promoted_iteration: int | None = None
+    # GAP-5: PR diff injected into Stage 3 prompt for reviewer feedback cycles
+    # Stores the unified diff of code_branch vs default_branch (capped to 400 lines)
+    # so the LLM knows what was already committed before the current review cycle.
+    pr_diff_summary: str = ""
 
     # ── Persistence ─────────────────────────────────────────────────────
 

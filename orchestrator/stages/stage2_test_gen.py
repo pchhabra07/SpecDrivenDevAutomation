@@ -286,6 +286,8 @@ def run(
             revised_tests, revised_ci = _revise_tests(
                 llm, context, approved_tests, gate_result.reviewer_comments,
                 ci_failure_output=last_ci_output,
+                gitlab=gitlab,
+                tests_branch=tests_branch,  # Fix 3 (ContextIssue)
             )
 
             # S2-5: Preflight repair on revised tests
@@ -402,6 +404,8 @@ def run(
                 revised_tests, revised_ci = _revise_tests(
                     llm, context, approved_tests, gate_result.reviewer_comments,
                     ci_failure_output=last_ci_output,
+                    gitlab=gitlab,
+                    tests_branch=tests_branch,  # Fix 3 (ContextIssue)
                 )
 
                 # S2-5: Preflight repair on revised tests
@@ -1010,6 +1014,8 @@ def _revise_tests(
     current_tests: dict[str, str],
     reviewer_comments: list[str],
     ci_failure_output: str = "",
+    gitlab: Any = None,
+    tests_branch: str = "",
 ) -> tuple[dict[str, str], tuple[str, str] | None]:
     """
     N2 fix: Uses ``chat_once()`` (stateless) so each revision cycle is a clean
@@ -1021,10 +1027,35 @@ def _revise_tests(
 
     Also enforces N3 (unconditional assertions), N4 (CSS value extraction from
     actual source), N6 (absolute file paths), and N8 (clear variable naming).
+
+    Fix 3 (ContextIssue): When ``gitlab`` and ``tests_branch`` are supplied,
+    re-fetches each test file from the branch HEAD before building the prompt.
+    This ensures the LLM operates on the latest committed tests rather than a
+    potentially stale in-memory ``approved_tests`` dict.
     """
     ticket = context.ticket
     ticket_hint = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
     stack = _detect_project_stack(context, ticket_hint=ticket_hint)
+
+    # ── Fix 3 (ContextIssue): Re-fetch test files from tests_branch HEAD ─
+    # The in-memory current_tests dict may lag behind what is actually
+    # committed on tests_branch (e.g. after force-push or multi-cycle
+    # revision). Refresh each path to guarantee the LLM sees reality.
+    if gitlab and tests_branch:
+        refreshed: dict[str, str] = {}
+        for path, fallback_content in current_tests.items():
+            try:
+                fresh = gitlab.get_file_content(path, ref=tests_branch)
+                refreshed[path] = fresh
+            except Exception:
+                # File may not exist on branch yet; keep in-memory content.
+                refreshed[path] = fallback_content
+        current_tests = refreshed
+        logger.info(
+            "Fix 3: Re-fetched %d test file(s) from branch '%s' for revision prompt.",
+            len(current_tests),
+            tests_branch,
+        )
 
     comments_text = "\n".join(f"- {c}" for c in reviewer_comments)
     current_tests_text = "\n".join(
@@ -1033,16 +1064,25 @@ def _revise_tests(
     )
     # Include the top source files so the LLM knows which paths/selectors exist.
     # S1-5 FIX: Prioritise LLM-selected files over symbol-padded fallbacks.
+    # Fix 3: Also re-fetch source files from tests_branch when available, since
+    # they may have been updated on that branch (e.g. fixture helpers added).
     source_summary = ""
     if context.source_files:
         priority_paths = context.llm_selected_paths or list(context.source_files.keys())
+        source_parts: list[str] = []
+        for path in priority_paths[:10]:
+            if path not in context.source_files:
+                continue
+            content = context.source_files[path]
+            if gitlab and tests_branch:
+                try:
+                    content = gitlab.get_file_content(path, ref=tests_branch)
+                except Exception:
+                    pass  # fall back to cached context content
+            source_parts.append(f"### `{path}`\n```\n{content}\n```")
         source_summary = (
             "## Repository Source Files (for reference — read these to extract real CSS values)\n"
-            + "\n".join(
-                f"### `{path}`\n```\n{context.source_files[path]}\n```"
-                for path in priority_paths[:10]
-                if path in context.source_files
-            )
+            + "\n".join(source_parts)
         )
 
     # N5: CI failure section
@@ -1128,6 +1168,7 @@ def _revise_tests(
             test_files[norm] = file_content
 
     return test_files if test_files else current_tests, ci_workflow
+
 
 def _validate_test_imports(
     test_files: dict[str, str],

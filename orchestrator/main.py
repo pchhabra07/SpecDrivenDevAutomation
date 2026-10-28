@@ -452,13 +452,45 @@ def run_pipeline(
                 )
 
                 # Phase 2: Expand context with files referenced by reviewer.
+                # Fix 2 (ContextIssue): pass checkpoint so the expansion
+                # fetches from code_branch instead of default_branch.
                 logger.info("Phase 2: Expanding context for reviewer feedback…")
                 refresh_context_for_feedback(
                     reviewer_feedback=stage5_result.reviewer_feedback,
                     context=context,
                     gitlab=gitlab,
                     audit=audit,
+                    checkpoint=checkpoint,
                 )
+
+                # GAP-5: Fetch PR diff so Stage 3 knows what was already done.
+                # Injecting the diff into the coding prompt prevents the LLM
+                # from repeating or reverting already-committed changes.
+                if checkpoint.code_branch and hasattr(gitlab, "get_branch_diff"):
+                    try:
+                        pr_diff = gitlab.get_branch_diff(
+                            source_branch=checkpoint.code_branch,
+                            target_branch=context.default_branch,
+                            max_lines=400,
+                        )
+                        if pr_diff:
+                            checkpoint.pr_diff_summary = pr_diff
+                            logger.info(
+                                "PR diff fetched: %d chars from %s → %s.",
+                                len(pr_diff),
+                                context.default_branch,
+                                checkpoint.code_branch,
+                            )
+                            audit.log(
+                                stage=3,
+                                event_type="pr_diff_fetched",
+                                payload={
+                                    "code_branch": checkpoint.code_branch,
+                                    "diff_chars": len(pr_diff),
+                                },
+                            )
+                    except Exception as _diff_exc:
+                        logger.warning("Could not fetch PR diff: %s", _diff_exc)
 
                 # Issue 12 fix: DO NOT call llm.append_user_message(feedback_prompt) here.
                 # Stage 3's _generate_code() already injects reviewer_feedback via its
@@ -472,6 +504,7 @@ def run_pipeline(
                 checkpoint.iteration_count = 0
                 checkpoint.save(settings.checkpoint_dir)
                 continue
+
 
             logger.error("Stage 5 ended without approval (status=%s)", stage5_result.status)
             return 1

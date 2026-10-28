@@ -19,9 +19,12 @@ from typing import Any
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.code_search import (
+    extract_identifiers_from_content,
     extract_symbols_from_text,
     find_additional_context_files,
+    rank_by_bm25,
     search_repository_for_symbols,
+    trace_import_graph,
 )
 from orchestrator.jira_client import TicketData
 from orchestrator.llm_client import LLMClient
@@ -580,19 +583,24 @@ def _rank_relevant_files(
     -------
     tuple[list[str], list[str]]
         ``(final_paths, llm_selected_paths)`` where *llm_selected_paths* is
-        the subset returned directly by the LLM (before any symbol-scored
-        padding) and *final_paths* is the padded list ready for fetching.
+        the subset returned directly by the LLM (before any padding) and
+        *final_paths* is the fully-expanded list ready for fetching.
 
-    Changes vs. original
-    --------------------
-    * S1-1: Builds a content-snippet index via ``_build_snippet_index()`` and
-      injects file previews into the ranking prompt so the LLM can make
-      content-aware decisions, not just filename-based guesses.
-    * S1-2: Replaces alphabetical padding with symbol-scored fallback and
-      emits a low-confidence warning when the LLM returns fewer than
-      ``_LLM_MIN_RETURN_THRESHOLD`` files.
-    * S1-5: Returns the pre-padding LLM selection as a second value so
-      ``run()`` can store it in ``TicketContext.llm_selected_paths``.
+    Improvements vs. original
+    -------------------------
+    * S1-1: Content-snippet index via ``_build_snippet_index()`` injects
+      file previews so the LLM makes content-aware decisions.
+    * S1-2: Symbol-scored padding replaces alphabetical order; low-confidence
+      warning when LLM returns too few files.
+    * S1-5: Pre-padding LLM selection stored as ``llm_selected_paths``.
+    * GAP-1 (BM25): BM25 pre-ranks all candidate paths against the ticket
+      text *before* building the snippet index, so the 60 files we read
+      and show to the LLM are the textually most relevant, not alphabetical.
+    * GAP-2 (Import graph): After LLM selection, parse import statements to
+      pull in direct dependencies that must also change.
+    * GAP-4 (Iterative refinement): Extract identifiers from top-ranked
+      files and search remaining repo for files that reference them,
+      surfacing callers/consumers that the LLM may have missed.
     """
     ticket_text = f"{ticket.summary} {ticket.description} {ticket.acceptance_criteria}"
     if symbols is None:
@@ -606,12 +614,41 @@ def _rank_relevant_files(
             f"Give higher priority to files that contain these symbols.\n"
         )
 
-    # S1-1: Build content snippet index (pre-fetches up to 60 files).
-    snippet_index = _build_snippet_index(paths, symbols, gitlab, branch)
+    # ── GAP-1: BM25 pre-ranking ─────────────────────────────────────────
+    # Before reading snippets, score all candidate paths via BM25 against the
+    # full ticket text. We use path strings as the "document" for paths we
+    # haven't fetched yet, then replace with snippet content once available.
+    # This ensures the 60-file reading budget is spent on the best candidates.
+    path_as_doc = {p: p.replace("/", " ").replace("_", " ").replace(".", " ") for p in paths}
+    bm25_ranked = rank_by_bm25(ticket_text, path_as_doc, top_n=min(len(paths), 120))
+    # Reorder paths by BM25 score; paths not in bm25_ranked go to the end.
+    bm25_set = set(bm25_ranked)
+    paths_for_snippets = bm25_ranked + [p for p in paths if p not in bm25_set]
+    logger.info(
+        "BM25 pre-ranking: reordered %d candidate paths for snippet budget.",
+        len(paths_for_snippets),
+    )
+
+    # S1-1: Build content snippet index (pre-fetches up to 60 files, now
+    # reading the BM25-top files first instead of alphabetical order).
+    snippet_index = _build_snippet_index(paths_for_snippets, symbols, gitlab, branch)
+
+    # Re-rank snippets with BM25 now that we have actual content
+    if snippet_index:
+        snippet_bm25 = rank_by_bm25(ticket_text, snippet_index, top_n=len(snippet_index))
+        # Build a priority-order list: BM25-snippet-ranked first, then remaining
+        snippet_set = set(snippet_bm25)
+        ordered_paths = snippet_bm25 + [p for p in paths_for_snippets if p not in snippet_set]
+        logger.info(
+            "BM25 content re-ranking: top 5 files are %s",
+            ordered_paths[:5],
+        )
+    else:
+        ordered_paths = paths_for_snippets
 
     # Build the paths block — inject previews where available.
     paths_text_lines = []
-    for p in paths:
+    for p in ordered_paths:
         if p in snippet_index:
             preview = snippet_index[p][:300].replace("\n", "\n    ")
             paths_text_lines.append(f"{p}\n    Preview:\n    {preview}")
@@ -637,8 +674,8 @@ def _rank_relevant_files(
     response = llm.chat(
         prompt,
         stage=1,
-        call_purpose="Rank relevant source files (content-aware)",
-        attached_files=paths,
+        call_purpose="Rank relevant source files (BM25 + content-aware)",
+        attached_files=ordered_paths[:60],
     )
     content = response.get("content", "")
 
@@ -651,11 +688,10 @@ def _rank_relevant_files(
         if len(selected) >= max_files:
             break
 
-    # Track the LLM-returned subset before any padding (S1-5).
+    # Track the LLM-returned subset before any expansion (S1-5).
     llm_selected = list(selected)
 
     # S1-2 FIX: emit low-confidence warning when the LLM returns too few files.
-    # Avoid false-positive warning if repository has fewer files than the threshold.
     min_expected = min(_LLM_MIN_RETURN_THRESHOLD, len(paths))
     if len(llm_selected) < min_expected:
         logger.warning(
@@ -674,12 +710,98 @@ def _rank_relevant_files(
                         "total_candidates": len(paths),
                     },
                 )
-            except Exception:  # never let audit failures break the pipeline
+            except Exception:
                 pass
 
-    # S1-2 FIX: pad with symbol-scored fallback instead of alphabetical order.
+    # ── GAP-2: Import graph expansion ───────────────────────────────────
+    # After LLM ranking, parse imports from selected files to pull in
+    # direct dependencies that must also change. Content for selected files
+    # is already available in the snippet cache.
+    selected_with_content = {
+        p: _snippet_content_cache.get(p, snippet_index.get(p, ""))
+        for p in selected
+    }
+    import_deps = trace_import_graph(
+        selected_files=selected_with_content,
+        all_file_paths=paths,
+        max_depth=1,
+        max_new_files=10,
+    )
+    selected_set = set(selected)
+    newly_from_imports = [p for p in import_deps if p not in selected_set]
+    if newly_from_imports:
+        logger.info(
+            "Import graph: added %d dependency file(s): %s",
+            len(newly_from_imports), newly_from_imports,
+        )
+        selected.extend(newly_from_imports)
+        selected_set.update(newly_from_imports)
+        if audit is not None:
+            try:
+                audit.log(
+                    stage=1,
+                    event_type="import_graph_expansion",
+                    payload={"added_files": newly_from_imports},
+                )
+            except Exception:
+                pass
+
+    # ── GAP-4: Iterative context refinement (second-pass grep) ──────────
+    # Extract exported identifiers from the top-ranked files, then search
+    # the remaining repo for files that reference those identifiers.
+    # This surfaces callers/consumers the LLM may have missed.
+    top_identifiers: list[str] = []
+    for p in llm_selected[:8]:  # inspect top 8 LLM-chosen files
+        cached_content = _snippet_content_cache.get(p, "")
+        if cached_content:
+            top_identifiers.extend(extract_identifiers_from_content(cached_content))
+    # De-duplicate and cap
+    seen_ids: set[str] = set()
+    unique_identifiers: list[str] = []
+    for ident in top_identifiers:
+        if ident not in seen_ids:
+            seen_ids.add(ident)
+            unique_identifiers.append(ident)
+    unique_identifiers = unique_identifiers[:20]
+
+    if unique_identifiers:
+        logger.info(
+            "Iterative refinement: searching for %d identifier(s) across remaining repo: %s",
+            len(unique_identifiers), unique_identifiers[:10],
+        )
+        refinement_hits = search_repository_for_symbols(
+            repo_root=".",
+            symbols=unique_identifiers,
+            all_file_paths=[p for p in paths if p not in selected_set],
+            gitlab=gitlab,
+            branch=branch,
+            max_api_scans=30,
+        )
+        newly_from_refinement: list[str] = []
+        for hit in refinement_hits:
+            if hit.path not in selected_set:
+                newly_from_refinement.append(hit.path)
+                selected_set.add(hit.path)
+        if newly_from_refinement:
+            logger.info(
+                "Iterative refinement: added %d caller/consumer file(s): %s",
+                len(newly_from_refinement), newly_from_refinement,
+            )
+            selected.extend(newly_from_refinement)
+            if audit is not None:
+                try:
+                    audit.log(
+                        stage=1,
+                        event_type="iterative_refinement",
+                        payload={"identifiers_searched": unique_identifiers[:10],
+                                 "added_files": newly_from_refinement},
+                    )
+                except Exception:
+                    pass
+
+    # S1-2 FIX: pad with symbol-scored fallback for any remaining budget.
     if len(selected) < max_files:
-        remaining = [p for p in paths if p not in set(selected)]
+        remaining = [p for p in paths if p not in selected_set]
         scored_remaining = _sort_by_symbol_relevance(remaining, symbols)
         original_count = len(selected)
         for p in scored_remaining:
@@ -689,12 +811,20 @@ def _rank_relevant_files(
         padded_count = len(selected) - original_count
         if padded_count > 0:
             logger.info(
-                "LLM returned %d file(s); padded %d more using symbol-scored fallback.",
-                original_count,
+                "Symbol-scored padding: added %d file(s) to fill context budget.",
                 padded_count,
             )
+    else:
+        padded_count = 0
 
-    logger.info("LLM ranked %d relevant files from %d candidates", len(selected), len(paths))
+    logger.info(
+        "File ranking complete: %d total (%d LLM, %d import-graph, %d iterative, %d padded)",
+        len(selected),
+        len(llm_selected),
+        len(newly_from_imports),
+        len(newly_from_refinement) if 'newly_from_refinement' in locals() else 0,
+        padded_count if 'padded_count' in locals() else 0,
+    )
     return selected, llm_selected
 
 
@@ -703,6 +833,7 @@ def refresh_context_for_feedback(
     context: "TicketContext",
     gitlab: Any,
     audit: "AuditLogger",
+    checkpoint: Any = None,
 ) -> None:
     """
     Phase 2 Gate-2 context re-expansion.
@@ -712,7 +843,25 @@ def refresh_context_for_feedback(
     by fetching those additional files from the VCS platform.
 
     Modifies ``context.source_files`` in-place.
+
+    Fix 2 (ContextIssue): Uses ``code_branch`` from *checkpoint* (when
+    available) instead of always falling back to ``default_branch``.
+    This ensures newly-referenced files are fetched at their latest
+    committed state on the PR branch, not the original master snapshot.
     """
+    # ── Fix 2 (ContextIssue): Prefer code_branch over default_branch ───
+    # If a checkpoint is provided and has a code_branch, fetch from there.
+    # Fall back to context.default_branch when no branch has been created yet
+    # (e.g. first-run before Stage 3 has started).
+    target_ref = (
+        getattr(checkpoint, "code_branch", None) or context.default_branch
+    )
+    logger.info(
+        "Gate-2 context expansion: fetching new files from ref '%s' (code_branch=%s).",
+        target_ref,
+        getattr(checkpoint, "code_branch", None),
+    )
+
     existing_paths = set(context.source_files.keys())
     expansion = find_additional_context_files(
         reviewer_feedback=reviewer_feedback,
@@ -720,7 +869,7 @@ def refresh_context_for_feedback(
         existing_context_paths=existing_paths,
         all_file_paths=context.all_file_paths,
         gitlab=gitlab,
-        branch=context.default_branch,
+        branch=target_ref,
         max_new_files=10,
     )
 
@@ -728,7 +877,7 @@ def refresh_context_for_feedback(
     for path in expansion.new_files_found:
         if path not in context.source_files:
             try:
-                content = gitlab.get_file_content(path, ref=context.default_branch)
+                content = gitlab.get_file_content(path, ref=target_ref)
                 context.source_files[path] = content
                 newly_fetched.append(path)
             except Exception as exc:
@@ -742,7 +891,8 @@ def refresh_context_for_feedback(
         audit.log(
             stage=1,
             event_type="context_expanded_for_review",
-            payload={"new_files": newly_fetched, "symbols_found": len(expansion.search_hits)},
+            payload={"new_files": newly_fetched, "symbols_found": len(expansion.search_hits), "ref": target_ref},
         )
     else:
         logger.info("Gate-2 context expansion: no new files needed.")
+

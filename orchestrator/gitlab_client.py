@@ -83,6 +83,70 @@ class GitLabClient:
         f = self._project.files.get(file_path=file_path, ref=ref)
         return base64.b64decode(f.content).decode("utf-8")
 
+    def get_branch_diff(
+        self,
+        source_branch: str,
+        target_branch: str | None = None,
+        max_lines: int = 400,
+    ) -> str:
+        """
+        Return a unified diff summary of *source_branch* vs *target_branch*.
+
+        GAP-5 (PR diff injection): Gives the LLM a compact picture of what
+        was already committed on the code branch before the current review
+        cycle, so it does not repeat or regress prior work.
+
+        Parameters
+        ----------
+        source_branch : str
+            The feature / code branch (e.g. ``automation/TICKET-1/code``).
+        target_branch : str | None
+            The base branch to diff against.  Defaults to the project's
+            default branch.
+        max_lines : int
+            Cap on returned diff lines to stay within token budget.
+
+        Returns
+        -------
+        str
+            Unified diff text, truncated to *max_lines* lines, or ``""``
+            on failure.
+        """
+        if target_branch is None:
+            target_branch = self.get_default_branch()
+        try:
+            compare = self._project.repository_compare(
+                from_=target_branch,
+                to=source_branch,
+            )
+            diff_parts: list[str] = []
+            for d in compare.get("diffs", []):
+                old_path = d.get("old_path", "")
+                new_path = d.get("new_path", "")
+                diff_text = d.get("diff", "")
+                header = f"--- {old_path}\n+++ {new_path}"
+                diff_parts.append(header)
+                diff_parts.append(diff_text)
+            full_diff = "\n".join(diff_parts)
+            lines = full_diff.splitlines()
+            if len(lines) > max_lines:
+                lines = lines[:max_lines] + [
+                    f"\n[... diff truncated at {max_lines} lines for token budget]"
+                ]
+            result = "\n".join(lines)
+            logger.info(
+                "Branch diff %s..%s: %d diff line(s) returned.",
+                target_branch, source_branch, len(lines),
+            )
+            return result
+        except Exception as exc:
+            logger.warning("Could not fetch branch diff %s..%s: %s", target_branch, source_branch, exc)
+            return ""
+
+    def get_pr_diff(self, source_branch: str, target_branch: str | None = None, max_lines: int = 400) -> str:
+        """Compatibility alias for get_branch_diff."""
+        return self.get_branch_diff(source_branch, target_branch, max_lines)
+
     def get_default_branch(self) -> str:
         """Return the name of the project's default branch."""
         return self._project.default_branch

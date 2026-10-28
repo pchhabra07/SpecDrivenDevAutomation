@@ -117,6 +117,39 @@ def run(
 
     # Build initial source snapshot from context.
     current_sources: dict[str, str] = dict(context.source_files)
+
+    # ── Fix 1 (ContextIssue): Re-hydrate from code_branch HEAD ─────────
+    # When this is a reviewer feedback cycle (review_iteration_count >= 1)
+    # or files were already committed to code_branch in a prior run,
+    # context.source_files still holds the original default_branch snapshot.
+    # Re-fetch every known path from code_branch so Iteration 1 of the
+    # reviewer feedback cycle sees the latest committed code, not master.
+    if checkpoint.review_iteration_count >= 1 or checkpoint.modified_files:
+        logger.info(
+            "Re-hydrating source context from %s (review cycle %d, %d previously modified files)…",
+            code_branch,
+            checkpoint.review_iteration_count,
+            len(checkpoint.modified_files),
+        )
+        for path in list(current_sources.keys()):
+            try:
+                branch_content = gitlab.get_file_content(path, ref=code_branch)
+                current_sources[path] = branch_content
+                context.source_files[path] = branch_content
+            except Exception:
+                # File may not exist on code_branch yet (e.g. brand-new files
+                # not yet committed); keep the base content from default_branch.
+                pass
+        audit.log(
+            stage=3,
+            event_type="context_rehydrated_from_branch",
+            payload={
+                "branch": code_branch,
+                "review_iteration_count": checkpoint.review_iteration_count,
+                "file_count": len(current_sources),
+            },
+        )
+
     last_test_output = ""
     start_iteration = checkpoint.iteration_count + 1
 
@@ -163,6 +196,8 @@ def run(
             locked_paths=locked_paths,
             reviewer_feedback=active_reviewer_feedback,
             reviewer_feedback_history=reviewer_history,
+            # GAP-5: inject diff of what's already committed on code_branch
+            pr_diff_summary=getattr(checkpoint, "pr_diff_summary", ""),
         )
         elapsed = _time.monotonic() - t0
         logger.info("LLM responded in %.1fs with %d file(s)", elapsed, len(generated_files) if generated_files else 0)
@@ -488,12 +523,17 @@ def _generate_code(
     locked_paths: set[str] | None = None,
     reviewer_feedback: list[str] | None = None,
     reviewer_feedback_history: list[list[str]] | None = None,
+    pr_diff_summary: str = "",
 ) -> dict[str, str]:
     """
     Prompt the LLM to generate code changes and parse the response.
 
     If the LLM tries to modify locked test files or CI workflows, it is re-prompted
     up to ``_MAX_LOCKED_REJECTIONS`` times.
+
+    GAP-5: When *pr_diff_summary* is supplied (Gate 2 reviewer feedback cycles),
+    the prompt includes a 'What Was Already Implemented' section so the LLM
+    knows what is already committed and does not regress or repeat prior work.
     """
     effective_blocked = set(blocked_paths or ()) | set(locked_paths or ())
     ticket = context.ticket
@@ -636,6 +676,21 @@ def _generate_code(
         f"**Description:**\n{ticket.description}\n\n"
         f"**Acceptance Criteria:**\n{ticket.acceptance_criteria}\n\n"
         f"{feedback_section}"
+    )
+
+    # GAP-5 (PR diff injection): When resuming after a Gate 2 reviewer feedback
+    # cycle, inject the diff of what was already committed on the branch so the
+    # LLM doesn't re-implement or accidentally revert completed work.
+    if pr_diff_summary and pr_diff_summary.strip():
+        prompt += (
+            "## What Was Already Implemented on This Branch\n"
+            "The following is the unified diff of changes already committed "
+            "on the code branch vs the default branch. "
+            "**DO NOT re-implement or revert these changes. Build on top of them.**\n"
+            f"```diff\n{pr_diff_summary}\n```\n\n"
+        )
+
+    prompt += (
         f"{iteration_context}"
         f"## Current Source Files\n{source_summary}\n\n"
         f"{locked_tests_summary}\n\n"

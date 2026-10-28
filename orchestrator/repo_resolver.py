@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any
 
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 
 logger = logging.getLogger(__name__)
 

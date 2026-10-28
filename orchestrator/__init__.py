@@ -1,2 +1,2 @@
-# orchestrator — Automated Ticket-to-PR Pipeline
-# Spec-driven development: JIRA → AI Coding Agent → GitLab PR
+# orchestrator — Automated GitHub Issue-to-PR Pipeline
+# Spec-driven development: GitHub Issues → AI Coding Agent → GitHub PR

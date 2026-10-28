@@ -15,17 +15,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.config import Settings
 from orchestrator.exceptions import GatePendingError
-from orchestrator.github_gate import (
-    GateOutcome as GhGateOutcome,
-    GateResult as GhGateResult,
-    check_approval_once as gh_check_approval_once,
-)
-from orchestrator.gitlab_gate import (
+from orchestrator.gate import (
     GateOutcome,
     GateResult,
-    check_approval_once as gl_check_approval_once,
+    check_approval_once,
 )
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 from orchestrator.stages.stage1_context import TicketContext
 from orchestrator.stages.stage2_test_gen import (
     _build_ci_prompt,
@@ -88,8 +83,8 @@ class TestNonBlockingGate1:
         }
         mock_client.get_pr_notes.return_value = []
 
-        res = gh_check_approval_once(mock_client, pr_number=42)
-        assert res.outcome == GhGateOutcome.PENDING
+        res = check_approval_once(mock_client, pr_number=42)
+        assert res.outcome == GateOutcome.PENDING
         assert res.approved_by == []
         assert res.reviewer_comments == []
 
@@ -102,8 +97,8 @@ class TestNonBlockingGate1:
         }
         mock_client.get_pr_notes.return_value = []
 
-        res = gh_check_approval_once(mock_client, pr_number=42)
-        assert res.outcome == GhGateOutcome.APPROVED
+        res = check_approval_once(mock_client, pr_number=42)
+        assert res.outcome == GateOutcome.APPROVED
         assert "alice" in res.approved_by
 
     def test_check_approval_once_github_changes_requested(self):
@@ -115,8 +110,8 @@ class TestNonBlockingGate1:
         }
         mock_client.get_pr_notes.return_value = [{"body": "Please add negative tests"}]
 
-        res = gh_check_approval_once(mock_client, pr_number=42)
-        assert res.outcome == GhGateOutcome.CHANGES_REQUESTED
+        res = check_approval_once(mock_client, pr_number=42)
+        assert res.outcome == GateOutcome.CHANGES_REQUESTED
         assert "Please add negative tests" in res.reviewer_comments
 
     def test_stage2_run_non_blocking_suspends_when_pending(self, tmp_path):

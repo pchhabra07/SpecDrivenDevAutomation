@@ -17,8 +17,7 @@ from orchestrator.checkpoint import Checkpoint
 from orchestrator.ci_poller import CIResult
 from orchestrator.config import Settings
 from orchestrator.github_client import GitHubClient, WorkflowRunResult
-from orchestrator.gitlab_client import GitLabClient, PipelineResult
-from orchestrator.jira_client import TicketData
+from orchestrator.models import PipelineResult, TicketData
 from orchestrator.main import _attempt_stage4_repair, run_pipeline
 from orchestrator.stages.stage1_context import TicketContext
 from orchestrator.stages.stage4_validation import (
@@ -277,24 +276,6 @@ class TestS4_1_Stage4RepairLoop:
 
 
 class TestClientLogMethods:
-    def test_gitlab_client_get_job_log(self):
-        client = GitLabClient.__new__(GitLabClient)
-        mock_project = MagicMock()
-        client._project = mock_project
-
-        mock_job = MagicMock()
-        mock_job.id = 42
-        mock_job.name = "eslint"
-        mock_job.trace.return_value = b"ESLint output: no errors"
-
-        mock_pipeline = MagicMock()
-        mock_pipeline.jobs.list.return_value = [mock_job]
-        mock_project.pipelines.get.return_value = mock_pipeline
-        mock_project.jobs.get.return_value = mock_job
-
-        log = client.get_job_log(10, "eslint")
-        assert "ESLint output" in log
-
     def test_github_client_get_job_log(self):
         client = GitHubClient.__new__(GitHubClient)
         client._repo_name = "test/repo"

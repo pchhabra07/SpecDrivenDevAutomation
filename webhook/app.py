@@ -170,7 +170,7 @@ def verify_github_hmac(raw_body: bytes, signature_header: str | None, secret: st
 @app.post("/webhooks/jira", status_code=status.HTTP_202_ACCEPTED)
 async def handle_jira_webhook(
     request: Request,
-    x_hub_signature: str | None = Header(None, alias="X-Hub-Signature"),
+    x_hub_signature_256: str | None = Header(None, alias="X-Hub-Signature-256"),
     secret: str | None = Query(None),
 ) -> dict[str, Any]:
     """
@@ -180,8 +180,9 @@ async def handle_jira_webhook(
     raw_body = await request.body()
 
     # 1. HMAC Verification
-    sig = x_hub_signature or secret
-    if settings.jira_webhook_secret and not verify_jira_hmac(raw_body, sig, settings.jira_webhook_secret):
+    sig = x_hub_signature_256 or secret
+    jira_secret = getattr(settings, "jira_webhook_secret", "")
+    if jira_secret and not verify_jira_hmac(raw_body, sig, jira_secret):
         logger.warning("Rejected JIRA webhook — invalid HMAC signature.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -206,7 +207,8 @@ async def handle_jira_webhook(
     # 3. Filter by project key
     project = fields.get("project", {})
     project_key = project.get("key", "")
-    if settings.jira_project_key and project_key != settings.jira_project_key:
+    target_project_key = getattr(settings, "jira_project_key", "")
+    if target_project_key and project_key != target_project_key:
         logger.debug("Ignoring ticket %s from non-target project %s", issue_key, project_key)
         return {"status": "ignored", "reason": "project_mismatch"}
 
@@ -406,49 +408,6 @@ async def handle_github_webhook(
         "ticket_id": ticket_id,
         "queue_position": queue_pos,
     }
-
-
-@app.post("/webhooks/gitlab", status_code=status.HTTP_200_OK)
-async def handle_gitlab_webhook(
-    request: Request,
-    x_gitlab_token: str | None = Header(None, alias="X-Gitlab-Token"),
-) -> dict[str, Any]:
-    """
-    GitLab webhook endpoint for MR updates and approval events (S2-1).
-    """
-    settings = get_settings()
-    if settings.gitlab_webhook_secret and x_gitlab_token != settings.gitlab_webhook_secret:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid GitLab token")
-
-    payload = await request.json()
-    object_kind = payload.get("object_kind")
-    logger.info("Received GitLab webhook: %s", object_kind)
-
-    # Re-enqueue ticket waiting on MR approval or feedback
-    if object_kind in ("merge_request", "note"):
-        mr = payload.get("merge_request", {}) or payload.get("object_attributes", {})
-        mr_iid = mr.get("iid") or payload.get("merge_request", {}).get("iid")
-        if mr_iid:
-            note_body = payload.get("object_attributes", {}).get("note", "")
-            if "<!-- spec-driven-bot -->" in note_body or "[spec-driven]" in note_body:
-                return {"status": "ignored", "reason": "bot_comment"}
-
-            ticket_id = _find_ticket_for_pr(int(mr_iid), settings.checkpoint_dir)
-            if ticket_id:
-                await task_queue.put(ticket_id)
-                queue_pos = task_queue.qsize()
-                logger.info(
-                    "Re-enqueued ticket %s after GitLab MR/Note event for MR !%s (queue position: %d)",
-                    ticket_id, mr_iid, queue_pos,
-                )
-                return {
-                    "status": "requeued",
-                    "ticket_id": ticket_id,
-                    "mr_iid": mr_iid,
-                    "queue_position": queue_pos,
-                }
-
-    return {"status": "received", "event": object_kind}
 
 
 @app.get("/health")

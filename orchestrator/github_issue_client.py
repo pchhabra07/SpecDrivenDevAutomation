@@ -17,7 +17,7 @@ from typing import Any
 
 from github import Auth, Github, GithubException
 
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 
 logger = logging.getLogger(__name__)
 

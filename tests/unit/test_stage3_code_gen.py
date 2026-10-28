@@ -9,8 +9,7 @@ import pytest
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.ci_poller import CIResult
-from orchestrator.gitlab_client import MergeRequestInfo
-from orchestrator.jira_client import TicketData
+from orchestrator.models import MergeRequestInfo, TicketData
 from orchestrator.stages.stage1_context import TicketContext
 from orchestrator.stages.stage3_code_gen import (
     _generate_code,

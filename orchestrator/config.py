@@ -17,13 +17,7 @@ from typing_extensions import Self
 class Settings(BaseSettings):
     """All orchestrator configuration — loaded from env vars."""
 
-    # ── Platform Selection ──────────────────────────────────────────────
-    platform: str = Field(
-        "github",
-        description="Active issue tracker and VCS platform: 'github' or 'gitlab_jira'",
-    )
-
-    # ── GitHub (Default) ────────────────────────────────────────────────
+    # ── GitHub ──────────────────────────────────────────────────────────
     github_token: str = Field(
         "",
         description="GitHub Personal Access Token or GitHub App Token (secret)",
@@ -48,21 +42,10 @@ class Settings(BaseSettings):
         "",
         description="Optional custom workflow file name in .github/workflows/ (defaults to <repo_name>-ci.yml)",
     )
-
-    # ── JIRA (Legacy / Alternative) ─────────────────────────────────────
-    jira_base_url: str = Field("", description="JIRA instance root URL")
-    jira_api_token: str = Field("", description="JIRA API token (secret)")
-    jira_user_email: str = Field("", description="JIRA user email for basic auth")
-    jira_project_key: str = Field("", description="JIRA project key filter")
     qualifying_label: str = Field(
         "SpecDrivenDev",
         description="Only tickets carrying this label are eligible for automation",
     )
-
-    # ── GitLab (Legacy / Alternative) ───────────────────────────────────
-    gitlab_base_url: str = Field("", description="GitLab instance URL")
-    gitlab_api_token: str = Field("", description="GitLab personal/project token (secret)")
-    gitlab_repo_id: int = Field(0, description="Target repo numeric ID")
 
     # ── NVIDIA NIM / LLM ───────────────────────────────────────────────
     nim_api_key: str = Field(..., description="NVIDIA NIM API key (secret)")
@@ -139,16 +122,8 @@ class Settings(BaseSettings):
     escalation_email: str = Field("", description="Email address for escalation alerts")
 
     # ── Webhook service (Phase 3) ──────────────────────────────────────
-    jira_webhook_secret: str = Field(
-        "",
-        description="Shared secret for validating incoming JIRA webhooks via HMAC-SHA256",
-    )
     webhook_host: str = Field("0.0.0.0", description="Host to bind FastAPI webhook service")
     webhook_port: int = Field(8000, description="Port to bind FastAPI webhook service")
-    gitlab_webhook_secret: str = Field(
-        "",
-        description="Secret token to validate incoming GitLab webhooks",
-    )
 
     # ── Reviewer feedback loop (Phase 3) ───────────────────────────────
     max_review_iterations: int = Field(
@@ -160,10 +135,6 @@ class Settings(BaseSettings):
     audit_shipping_mode: str = Field(
         "none",
         description="Audit shipping mode: 'git', 'http', or 'none'",
-    )
-    audit_gitlab_repo_id: int | None = Field(
-        None,
-        description="GitLab repo ID to commit audit logs into when audit_shipping_mode is 'git'",
     )
     siem_webhook_url: str = Field(
         "",
@@ -211,35 +182,26 @@ class Settings(BaseSettings):
         description="Wait synchronously for human gates (for CLI/dev use; set False for non-blocking server/webhook mode)",
     )
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
     @model_validator(mode="after")
-    def validate_platform_credentials(self) -> Self:
+    def validate_github_credentials(self) -> Self:
         if self.github_repo:
             repo = self.github_repo.strip()
             if "github.com" in repo:
                 repo = repo.split("github.com", 1)[1].lstrip("/:").removesuffix(".git")
             self.github_repo = repo
-
         if self.github_audit_repo:
             audit_repo = self.github_audit_repo.strip()
             if "github.com" in audit_repo:
                 audit_repo = audit_repo.split("github.com", 1)[1].lstrip("/:").removesuffix(".git")
             self.github_audit_repo = audit_repo
-
-        has_github = bool(self.github_token and self.github_repo)
-        has_jira = bool(self.jira_base_url and self.jira_api_token and self.jira_user_email and self.jira_project_key)
-        has_gitlab = bool(self.gitlab_base_url and self.gitlab_api_token and self.gitlab_repo_id)
-
-        if self.jira_base_url and not has_jira:
-            raise ValueError("Incomplete JIRA credentials: JIRA_BASE_URL was provided but API token, email, or project key is missing.")
-
-        if self.gitlab_base_url and not has_gitlab:
-            raise ValueError("Incomplete GitLab credentials: GITLAB_BASE_URL was provided but API token or repo ID is missing.")
-
-        if not has_github and not (has_jira and has_gitlab):
-            raise ValueError("Either complete GitHub credentials (GITHUB_TOKEN, GITHUB_REPO) or complete JIRA+GitLab credentials must be provided.")
-
+        if not self.github_token or not self.github_repo:
+            raise ValueError("GITHUB_TOKEN and GITHUB_REPO are required.")
         return self
 
 

@@ -26,7 +26,7 @@ from orchestrator.code_search import (
     extract_symbols_from_text,
     search_repository_for_symbols,
 )
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 from orchestrator.stages.stage1_context import (
     TicketContext,
     _build_snippet_index,

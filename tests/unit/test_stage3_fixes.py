@@ -25,7 +25,7 @@ from orchestrator.diff_patcher import (
     apply_patches,
     apply_patches_to_sources,
 )
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 from orchestrator.preflight_checker import (
     PreflightResult,
     _check_file,

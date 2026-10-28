@@ -17,15 +17,16 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
+import re as _re
+import time as _time
 from typing import Any
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.config import Settings, get_settings
 from orchestrator.exceptions import GatePendingError
-from orchestrator.gitlab_client import GitLabClient
-from orchestrator.jira_client import JiraClient
+from orchestrator.github_client import GitHubClient
+from orchestrator.github_issue_client import GitHubIssueClient
 from orchestrator.llm_client import LLMClient
 from orchestrator.rate_limiter import RateLimiter
 from orchestrator.repo_resolver import RepoResolver
@@ -94,32 +95,19 @@ def run_pipeline(
 
     rate_limiter = RateLimiter(max_calls=settings.rate_limit_cap)
 
-    if settings.platform == "github" or (settings.github_token and settings.github_repo):
-        from orchestrator.github_client import GitHubClient
-        from orchestrator.github_issue_client import GitHubIssueClient
-
-        jira = GitHubIssueClient(
-            token=settings.github_token,
-            repo=settings.github_repo,
-            base_url=settings.github_base_url,
-        )
-        gitlab = GitHubClient(
-            token=settings.github_token,
-            repo=settings.github_repo,
-            base_url=settings.github_base_url,
-            workflow_file=settings.github_workflow_file or None,
-        )
-    else:
-        jira = JiraClient(
-            base_url=settings.jira_base_url,
-            email=settings.jira_user_email,
-            api_token=settings.jira_api_token,
-        )
-        gitlab = GitLabClient(
-            base_url=settings.gitlab_base_url,
-            private_token=settings.gitlab_api_token,
-            repo_id=settings.gitlab_repo_id,
-        )
+    issue_client = GitHubIssueClient(
+        token=settings.github_token,
+        repo=settings.github_repo,
+        base_url=settings.github_base_url,
+    )
+    vcs_client = GitHubClient(
+        token=settings.github_token,
+        repo=settings.github_repo,
+        base_url=settings.github_base_url,
+        workflow_file=settings.github_workflow_file or None,
+    )
+    jira = issue_client
+    gitlab = vcs_client
 
     llm = LLMClient(
         api_key=settings.nim_api_key,
@@ -155,6 +143,39 @@ def run_pipeline(
                 )
                 checkpoint = Checkpoint(ticket_id=ticket_id, checkpoint_dir=settings.checkpoint_dir)
                 checkpoint.repo_id = gitlab.project_id
+
+        if checkpoint.gate_waiting == "gate1":
+            checkpoint.current_stage = 2
+            logger.info(
+                "Resuming at Gate 1 checkpoint (PR #%d)",
+                checkpoint.gate_waiting_mr_iid,
+            )
+        elif checkpoint.gate_waiting == "gate2":
+            checkpoint.current_stage = 5
+            logger.info(
+                "Resuming at Gate 2 checkpoint (PR #%d)",
+                checkpoint.gate_waiting_mr_iid,
+            )
+
+        if checkpoint.gate_waiting and checkpoint.gate_waiting_since:
+            elapsed_hours = (_time.time() - checkpoint.gate_waiting_since) / 3600
+            if elapsed_hours > settings.gate_timeout_hours:
+                logger.error(
+                    "Gate '%s' for ticket %s timed out after %.1fh.",
+                    checkpoint.gate_waiting,
+                    ticket_id,
+                    elapsed_hours,
+                )
+                issue_client.post_lifecycle_comment(
+                    ticket_id=ticket_id,
+                    title="Gate Timeout",
+                    message=(
+                        f"Gate '{checkpoint.gate_waiting}' timed out after "
+                        f"{settings.gate_timeout_hours}h with no human review. "
+                        "Pipeline halted. Please review manually."
+                    ),
+                )
+                return 1
 
         if checkpoint.current_stage > 1:
             logger.info(
@@ -576,8 +597,19 @@ def _attempt_stage4_repair(
 
     editable_sources = {k: v for k, v in current_sources.items() if k not in blocked_paths}
 
+    mentioned_in_logs: set[str] = set()
+    for log_text in gate_logs.values():
+        for match in _re.finditer(
+            r'[\w./\-]+\.(?:js|ts|tsx|jsx|py|css|html|json)\b', log_text
+        ):
+            mentioned_in_logs.add(match.group(0).lstrip("./"))
+
+    prioritized = [p for p in editable_sources if any(m in p for m in mentioned_in_logs)]
+    rest = [p for p in editable_sources if p not in set(prioritized)]
+    ordered_sources = {p: editable_sources[p] for p in (prioritized + rest)[:10]}
+
     source_parts = []
-    for path, content in list(editable_sources.items())[:10]:
+    for path, content in ordered_sources.items():
         source_parts.append(f"### `{path}`\n```{_lang_for_path(path)}\n{content}\n```")
     source_summary = "\n\n".join(source_parts)
 
@@ -608,7 +640,7 @@ def _attempt_stage4_repair(
         prompt,
         stage=4,
         call_purpose="Stage 4 validation gate failure repair",
-        attached_files=list(editable_sources.keys()),
+        attached_files=list(ordered_sources.keys()),
     )
     raw_content = response.get("content", "")
     parsed = parse_llm_response(raw_content)

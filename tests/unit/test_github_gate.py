@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from orchestrator.github_gate import (
+from orchestrator.gate import (
     GateOutcome,
     GateResult,
     GateTimeoutError,
@@ -44,7 +44,7 @@ class TestGitHubWaitForApproval:
         ]
         mock_gh.get_pr_notes.return_value = []
 
-        with patch("orchestrator.github_gate.time.sleep"):
+        with patch("orchestrator.gate.time.sleep"):
             result = wait_for_approval(
                 client=mock_gh,
                 pr_number=102,
@@ -86,8 +86,8 @@ class TestGitHubWaitForApproval:
         }
         mock_gh.get_pr_notes.return_value = []
 
-        with patch("orchestrator.github_gate.time.sleep"):
-            with patch("orchestrator.github_gate.time.monotonic") as mock_time:
+        with patch("orchestrator.gate.time.sleep"):
+            with patch("orchestrator.gate.time.monotonic") as mock_time:
                 mock_time.side_effect = [0.0, 0.0, 999999.0]
                 with pytest.raises(GateTimeoutError):
                     wait_for_approval(
@@ -125,7 +125,7 @@ class TestGitHubWaitForApproval:
             {"approved": False, "approved_by": [], "changes_requested": False},
             {"approved": True, "approved_by": ["lead-dev"], "changes_requested": False},
         ]
-        with patch("orchestrator.github_gate.time.sleep"):
+        with patch("orchestrator.gate.time.sleep"):
             result2 = wait_for_approval(
                 client=mock_gh,
                 pr_number=105,
@@ -148,7 +148,7 @@ class TestGitHubWaitForApproval:
             {"body": "<!-- spec-driven-bot -->\nNotification", "system": False},
         ]
 
-        with patch("orchestrator.github_gate.time.sleep"):
+        with patch("orchestrator.gate.time.sleep"):
             result = wait_for_approval(
                 client=mock_gh,
                 pr_number=106,

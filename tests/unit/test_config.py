@@ -13,13 +13,8 @@ from orchestrator.config import Settings
 
 # Minimum set of env vars required to instantiate Settings without error.
 _REQUIRED_ENV = {
-    "JIRA_BASE_URL": "https://test.atlassian.net",
-    "JIRA_API_TOKEN": "jira-token",
-    "JIRA_USER_EMAIL": "user@example.com",
-    "JIRA_PROJECT_KEY": "TEST",
-    "GITLAB_BASE_URL": "https://gitlab.example.com",
-    "GITLAB_API_TOKEN": "gl-token",
-    "GITLAB_REPO_ID": "42",
+    "GITHUB_TOKEN": "ghp_1234567890abcdef",
+    "GITHUB_REPO": "pchhabra07/SpecDrivenDevAutomation",
     "NIM_API_KEY": "nim-key",
     "NIM_BASE_URL": "https://integrate.api.nvidia.com/v1",
 }
@@ -32,8 +27,8 @@ class TestSettings:
         """Settings should instantiate when all required vars are present."""
         with patch.dict(os.environ, _REQUIRED_ENV, clear=False):
             s = Settings()
-            assert s.jira_base_url == "https://test.atlassian.net"
-            assert s.gitlab_repo_id == 42
+            assert s.github_token == "ghp_1234567890abcdef"
+            assert s.github_repo == "pchhabra07/SpecDrivenDevAutomation"
             assert s.nim_api_key == "nim-key"
 
     def test_defaults_are_applied(self):
@@ -50,7 +45,7 @@ class TestSettings:
     def test_missing_required_raises(self):
         """Omitting a required field should raise a validation error."""
         incomplete = dict(_REQUIRED_ENV)
-        del incomplete["JIRA_API_TOKEN"]
+        del incomplete["GITHUB_TOKEN"]
         with patch.dict(os.environ, incomplete, clear=True):
             with pytest.raises(Exception):
                 Settings(_env_file=None)
@@ -69,18 +64,14 @@ class TestSettings:
             assert s.rate_limit_cap == 10
             assert s.max_code_iterations == 3
 
-    def test_loads_github_settings(self):
-        """Settings should instantiate with GitHub configuration alone."""
+    def test_repo_normalization(self):
+        """Full GitHub URLs should be normalized to owner/repo format."""
         github_env = {
-            "PLATFORM": "github",
-            "GITHUB_TOKEN": "ghp_1234567890abcdef",
-            "GITHUB_REPO": "pchhabra07/SpecDrivenDevAutomation",
-            "NIM_API_KEY": "nim-key",
-            "NIM_BASE_URL": "https://integrate.api.nvidia.com/v1",
+            **_REQUIRED_ENV,
+            "GITHUB_REPO": "https://github.com/pchhabra07/SpecDrivenDevAutomation.git",
+            "GITHUB_AUDIT_REPO": "git@github.com:pchhabra07/audit-log.git",
         }
         with patch.dict(os.environ, github_env, clear=True):
             s = Settings(_env_file=None)
-            assert s.platform == "github"
-            assert s.github_token == "ghp_1234567890abcdef"
             assert s.github_repo == "pchhabra07/SpecDrivenDevAutomation"
-            assert s.github_base_url == "https://api.github.com"
+            assert s.github_audit_repo == "pchhabra07/audit-log"

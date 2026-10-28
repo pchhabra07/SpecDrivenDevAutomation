@@ -1,12 +1,12 @@
 """
-Unit tests for orchestrator.gitlab_gate.
+Unit tests for orchestrator.gate.
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from orchestrator.gitlab_gate import (
+from orchestrator.gate import (
     GateOutcome,
     GateResult,
     GateTimeoutError,
@@ -47,7 +47,7 @@ class TestWaitForApproval:
         ]
         mock_gl.get_mr_notes.return_value = []
 
-        with patch("orchestrator.gitlab_gate.time.sleep"):
+        with patch("orchestrator.gate.time.sleep"):
             result = wait_for_approval(
                 gitlab=mock_gl,
                 mr_iid=10,
@@ -64,8 +64,8 @@ class TestWaitForApproval:
         mock_gl.get_mr_approvals.return_value = {"approved": False, "approved_by": []}
         mock_gl.get_mr_notes.return_value = []
 
-        with patch("orchestrator.gitlab_gate.time.sleep"):
-            with patch("orchestrator.gitlab_gate.time.monotonic") as mock_time:
+        with patch("orchestrator.gate.time.sleep"):
+            with patch("orchestrator.gate.time.monotonic") as mock_time:
                 # First call: start time.  Second call: past deadline.
                 mock_time.side_effect = [0.0, 0.0, 999999.0]
                 with pytest.raises(GateTimeoutError):
@@ -124,7 +124,7 @@ class TestWaitForApproval:
             {"approved": False, "approved_by": []},
             {"approved": True, "approved_by": ["lead-dev"]},
         ]
-        with patch("orchestrator.gitlab_gate.time.sleep"):
+        with patch("orchestrator.gate.time.sleep"):
             result2 = wait_for_approval(
                 gitlab=mock_gl,
                 mr_iid=15,
@@ -148,7 +148,7 @@ class TestWaitForApproval:
             {"body": "<!-- spec-driven-bot -->\nNotification", "system": False},
         ]
 
-        with patch("orchestrator.gitlab_gate.time.sleep"):
+        with patch("orchestrator.gate.time.sleep"):
             result = wait_for_approval(
                 gitlab=mock_gl,
                 mr_iid=20,

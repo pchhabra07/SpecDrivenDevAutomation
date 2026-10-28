@@ -55,7 +55,7 @@ class TestWebhookEndpoints:
         response = client.post(
             "/webhooks/jira",
             content=body,
-            headers={"X-Hub-Signature": "sha256=wrong"},
+            headers={"X-Hub-Signature-256": "sha256=wrong"},
         )
         assert response.status_code == 401
 
@@ -85,7 +85,7 @@ class TestWebhookEndpoints:
         response = client.post(
             "/webhooks/jira",
             content=body,
-            headers={"X-Hub-Signature": sig},
+            headers={"X-Hub-Signature-256": sig},
         )
 
         assert response.status_code == 202

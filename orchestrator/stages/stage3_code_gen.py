@@ -140,6 +140,17 @@ def run(
                 # File may not exist on code_branch yet (e.g. brand-new files
                 # not yet committed); keep the base content from default_branch.
                 pass
+
+        # Discover newly created files on code_branch that were not in initial context
+        for path in checkpoint.modified_files:
+            if path not in current_sources and path not in locked_paths:
+                try:
+                    content = gitlab.get_file_content(path, ref=code_branch)
+                    if content is not None:
+                        current_sources[path] = content
+                        context.source_files[path] = content
+                except Exception:
+                    pass
         audit.log(
             stage=3,
             event_type="context_rehydrated_from_branch",
@@ -278,7 +289,7 @@ def run(
             commit_sha=commit_sha,
         )
         checkpoint.ci_pipeline_id = pipeline_id
-        checkpoint.save()
+        checkpoint.save(checkpoint.checkpoint_dir)
 
         ci_result: CIResult = wait_for_pipeline(
             gitlab, pipeline_id,
@@ -334,7 +345,7 @@ def run(
                 "test_results": test_results,
             },
         )
-        checkpoint.save()
+        checkpoint.save(checkpoint.checkpoint_dir)
 
         # ── 6. Check if all tests pass ─────────────────────────────────
         if ci_result.passed and test_results.get("failed", 0) == 0:
@@ -364,7 +375,7 @@ def run(
                         "web_url": full_ci_result.web_url,
                         "jobs": full_ci_result.jobs,
                     }
-                    checkpoint.save()
+                    checkpoint.save(checkpoint.checkpoint_dir)
                     logger.info("Full CI pipeline %d completed (status=%s) and cached for Stage 4", full_pipeline_id, full_ci_result.status)
                 except Exception as exc:
                     logger.warning("Could not execute full CI pipeline in Stage 3: %s", exc)

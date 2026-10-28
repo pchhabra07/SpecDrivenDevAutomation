@@ -16,12 +16,15 @@ permissions:
   pull-requests: write
   checks: write
 
+env:
+  TEST_ONLY: ${{ github.event.inputs.test_only || 'false' }}
+
 jobs:
   # ── Gate 1: Code Style & Quality ────────────────────────────────────
   lint:
     name: lint
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.test_only != 'true' }}
+    if: ${{ env.TEST_ONLY != 'true' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -49,7 +52,7 @@ jobs:
   security-sast:
     name: security-sast
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.test_only != 'true' }}
+    if: ${{ env.TEST_ONLY != 'true' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -69,7 +72,7 @@ jobs:
   security-deps:
     name: security-deps
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.test_only != 'true' }}
+    if: ${{ env.TEST_ONLY != 'true' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -125,7 +128,7 @@ jobs:
   sonarqube:
     name: sonarqube
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.test_only != 'true' }}
+    if: ${{ env.TEST_ONLY != 'true' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

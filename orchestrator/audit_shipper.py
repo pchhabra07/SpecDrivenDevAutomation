@@ -67,10 +67,9 @@ def ship_audit_log_to_git(
         f"Timestamp: {now.isoformat()}"
     )
 
-    # If active_client has commit_files and not _gl, it is GitHubClient
-    if hasattr(active_client, "commit_files") and not hasattr(active_client, "_gl"):
+    if hasattr(active_client, "commit_files"):
         original_repo = getattr(active_client, "repo_name", None)
-        if target_repo and str(target_repo) != str(original_repo):
+        if target_repo and str(target_repo) != str(original_repo) and hasattr(active_client, "switch_repo"):
             active_client.switch_repo(str(target_repo))
             try:
                 commit_id = active_client.commit_files(
@@ -88,34 +87,7 @@ def ship_audit_log_to_git(
             commit_message=commit_msg,
         )
 
-    # GitLab fallback
-    audit_project = active_client._gl.projects.get(target_repo)
-
-    # Determine commit action: create or update
-    try:
-        audit_project.files.get(file_path=target_path, ref=branch)
-        action = "update"
-    except Exception:
-        action = "create"
-
-    commit = audit_project.commits.create({
-        "branch": branch,
-        "commit_message": commit_msg,
-        "actions": [{
-            "action": action,
-            "file_path": target_path,
-            "content": content,
-        }],
-    })
-
-    logger.info(
-        "Shipped audit log for %s to repo %s (commit: %s, SHA256: %s)",
-        ticket_id,
-        target_repo,
-        commit.id[:10],
-        sha256[:12],
-    )
-    return commit.id
+    raise ValueError("active_client does not support commit_files")
 
 
 def ship_audit_log_to_siem(
@@ -178,7 +150,7 @@ def ship_audit_log(
     mode = settings.audit_shipping_mode.lower()
 
     if mode == "git":
-        target_audit_repo = settings.github_audit_repo or settings.audit_gitlab_repo_id
+        target_audit_repo = settings.github_audit_repo
         if not target_audit_repo:
             logger.warning("audit_shipping_mode is 'git' but audit repo is unset.")
             return {"status": "failed", "reason": "missing_audit_repo", "sha256": sha256}

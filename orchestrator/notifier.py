@@ -111,10 +111,8 @@ def build_escalation_message(
 
 
 def _platform_names(url: str) -> tuple[str, str]:
-    """Return (platform_name, pr_type_name) based on URL."""
-    if "github" in (url or "").lower():
-        return "GitHub", "Pull Request"
-    return "GitLab", "Merge Request"
+    """Return (platform_name, pr_type_name) for notifications."""
+    return "GitHub", "Pull Request"
 
 
 def notify_gate1_pending(

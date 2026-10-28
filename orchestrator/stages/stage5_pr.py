@@ -26,7 +26,7 @@ from typing import Any
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.exceptions import GatePendingError
-from orchestrator.gitlab_gate import (
+from orchestrator.gate import (
     GateOutcome,
     GateResult,
     check_approval_once,

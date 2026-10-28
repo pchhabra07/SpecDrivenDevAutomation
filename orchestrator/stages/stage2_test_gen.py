@@ -34,7 +34,7 @@ from orchestrator.ci_generator import (
     generate_fallback_ci,
 )
 from orchestrator.exceptions import GatePendingError
-from orchestrator.gitlab_gate import GateOutcome, check_approval_once, wait_for_approval
+from orchestrator.gate import GateOutcome, check_approval_once, wait_for_approval
 from orchestrator.llm_client import LLMClient
 from orchestrator.preflight_checker import check_all, _check_yaml
 from orchestrator.stages.stage1_context import TicketContext
@@ -208,7 +208,7 @@ def run(
         checkpoint.generated_test_files = generated_tests
 
         if checkpoint.gate1_mr_iid is None:
-            logger.info("Opening draft PR for Gate 1 review…")
+            logger.info("Opening PR for Gate 1 review…")
             mr_info = gitlab.create_mr(
                 source_branch=tests_branch,
                 target_branch=context.default_branch,
@@ -218,7 +218,7 @@ def run(
                     generated_tests,
                     ci_workflow_path=ci_workflow_path if ci_created_or_updated else None,
                 ),
-                draft=True,
+                draft=False,
             )
             checkpoint.gate1_mr_iid = mr_info.iid
             audit.log(stage=2, event_type="gate1_opened", payload={"mr_iid": mr_info.iid})

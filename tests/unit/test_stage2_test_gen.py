@@ -4,7 +4,7 @@ Unit tests for orchestrator.stages.stage2_test_gen.
 
 from unittest.mock import MagicMock
 
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 from orchestrator.stages.stage1_context import TicketContext
 from orchestrator.stages.stage2_test_gen import (
     _check_vacuous_assertions,

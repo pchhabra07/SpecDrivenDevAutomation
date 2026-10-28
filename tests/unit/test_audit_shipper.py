@@ -35,25 +35,20 @@ class TestAuditShipper:
             compute_file_sha256(tmp_path / "nonexistent.jsonl")
 
     def test_ship_audit_log_to_git(self, temp_audit_file):
-        mock_gitlab = MagicMock()
-        mock_project = MagicMock()
-        mock_gitlab._gl.projects.get.return_value = mock_project
-
-        mock_commit = MagicMock()
-        mock_commit.id = "abcdef1234567890"
-        mock_project.commits.create.return_value = mock_commit
+        mock_client = MagicMock()
+        mock_client.commit_files.return_value = "abcdef1234567890"
 
         commit_id = ship_audit_log_to_git(
             filepath=temp_audit_file,
-            gitlab=mock_gitlab,
-            audit_repo_id=999,
+            client=mock_client,
+            audit_repo="org/audit-repo",
         )
 
         assert commit_id == "abcdef1234567890"
-        mock_project.commits.create.assert_called_once()
-        args = mock_project.commits.create.call_args[0][0]
-        assert "PROJ-123" in args["commit_message"]
-        assert len(args["actions"]) == 1
+        mock_client.commit_files.assert_called_once()
+        kwargs = mock_client.commit_files.call_args[1]
+        assert "PROJ-123" in kwargs["commit_message"]
+        assert len(kwargs["files"]) == 1
 
     @patch("httpx.post")
     def test_ship_audit_log_to_siem_success(self, mock_post, temp_audit_file):
@@ -88,13 +83,8 @@ class TestAuditShipper:
 
     def test_ship_audit_log_local_mode(self, temp_audit_file, tmp_path):
         settings = Settings(
-            jira_base_url="https://jira.test",
-            jira_api_token="token",
-            jira_user_email="user@test.com",
-            jira_project_key="PROJ",
-            gitlab_base_url="https://gitlab.test",
-            gitlab_api_token="token",
-            gitlab_repo_id=1,
+            github_token="ghp_test",
+            github_repo="org/repo",
             nim_api_key="token",
             nim_base_url="https://nim.test",
             audit_shipping_mode="none",
@@ -106,13 +96,8 @@ class TestAuditShipper:
 
     def test_ship_audit_log_missing_file(self, tmp_path):
         settings = Settings(
-            jira_base_url="https://jira.test",
-            jira_api_token="token",
-            jira_user_email="user@test.com",
-            jira_project_key="PROJ",
-            gitlab_base_url="https://gitlab.test",
-            gitlab_api_token="token",
-            gitlab_repo_id=1,
+            github_token="ghp_test",
+            github_repo="org/repo",
             nim_api_key="token",
             nim_base_url="https://nim.test",
             audit_shipping_mode="none",

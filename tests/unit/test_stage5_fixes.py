@@ -20,11 +20,10 @@ from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.config import Settings
 from orchestrator.exceptions import GatePendingError
+from orchestrator.gate import GateOutcome, GateResult
 from orchestrator.github_client import GitHubClient
 from orchestrator.github_issue_client import GitHubIssueClient
-from orchestrator.gitlab_client import GitLabClient
-from orchestrator.gitlab_gate import GateOutcome, GateResult
-from orchestrator.jira_client import JiraClient, TicketData
+from orchestrator.models import TicketData
 from orchestrator.main import run_pipeline
 from orchestrator.protocols import IssueTrackerClient, VCSClient
 from orchestrator.stages.stage1_context import TicketContext
@@ -95,7 +94,7 @@ class TestS5_1_NonBlockingGate2:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         with pytest.raises(GatePendingError) as exc_info:
             stage5_run(
@@ -148,7 +147,7 @@ class TestS5_1_NonBlockingGate2:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -193,7 +192,7 @@ class TestS5_1_NonBlockingGate2:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -242,8 +241,8 @@ class TestS5_1_NonBlockingGate2:
 
         with patch("orchestrator.main.stage1_context.run") as mock_stage1:
             mock_stage1.return_value = _make_context()
-            with patch("orchestrator.github_issue_client.GitHubIssueClient"):
-                with patch("orchestrator.github_client.GitHubClient"):
+            with patch("orchestrator.main.GitHubIssueClient"):
+                with patch("orchestrator.main.GitHubClient"):
                     with patch("orchestrator.main.LLMClient"):
                         code = run_pipeline("PROJ-200", settings=settings)
 
@@ -271,7 +270,7 @@ class TestS5_1_StaleGateTimeoutAndIdempotency:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -364,7 +363,7 @@ class TestS5_1_StaleGateTimeoutAndIdempotency:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         with pytest.raises(GatePendingError):
             stage5_run(
@@ -534,21 +533,6 @@ class TestS5_2_CanonicalPRUrl:
         url = client.get_pr_url(123)
         assert url == "https://github.com/my-org/my-project/pull/123"
 
-    @patch("orchestrator.gitlab_client.gitlab.Gitlab")
-    def test_gitlab_client_get_pr_url(self, mock_gl_cls):
-        mock_gl = mock_gl_cls.return_value
-        mock_proj = MagicMock()
-        mock_proj.web_url = "https://gitlab.example.com/team/service"
-        mock_gl.projects.get.return_value = mock_proj
-
-        client = GitLabClient(base_url="https://gitlab.example.com", private_token="glpat_test", repo_id=45)
-        url = client.get_pr_url(88)
-        assert url == "https://gitlab.example.com/team/service/-/merge_requests/88"
-
-
-class TestS5_4_ProtocolsAndCanonicalAliases:
-    """Tests for S5-4: Protocol conformance and canonical aliases."""
-
     @patch("orchestrator.github_client.Github")
     def test_github_client_conforms_to_vcs_protocol(self, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
@@ -556,15 +540,6 @@ class TestS5_4_ProtocolsAndCanonicalAliases:
         mock_gh.get_repo.return_value = mock_repo
 
         client = GitHubClient(token="ghp_test", repo="org/repo")
-        assert isinstance(client, VCSClient)
-
-    @patch("orchestrator.gitlab_client.gitlab.Gitlab")
-    def test_gitlab_client_conforms_to_vcs_protocol(self, mock_gl_cls):
-        mock_gl = mock_gl_cls.return_value
-        mock_proj = MagicMock()
-        mock_gl.projects.get.return_value = mock_proj
-
-        client = GitLabClient(base_url="https://gitlab.test", private_token="tok", repo_id=1)
         assert isinstance(client, VCSClient)
 
     @patch("orchestrator.github_issue_client.Github")
@@ -575,31 +550,6 @@ class TestS5_4_ProtocolsAndCanonicalAliases:
 
         client = GitHubIssueClient(token="ghp_test", repo="org/repo")
         assert isinstance(client, IssueTrackerClient)
-
-    @patch("orchestrator.jira_client.Jira")
-    def test_jira_client_conforms_to_issue_tracker_protocol(self, mock_jira_cls):
-        client = JiraClient(base_url="https://jira.test", email="user@test.com", api_token="tok")
-        assert isinstance(client, IssueTrackerClient)
-
-    @patch("orchestrator.gitlab_client.gitlab.Gitlab")
-    def test_gitlab_client_get_pr_notes_alias(self, mock_gl_cls):
-        mock_gl = mock_gl_cls.return_value
-        mock_proj = MagicMock()
-        mock_mr = MagicMock()
-        mock_note = MagicMock()
-        mock_note.author = {"username": "reviewer1"}
-        mock_note.body = "Please refactor"
-        mock_note.created_at = "2026-10-21T10:00:00Z"
-        mock_note.system = False
-        mock_mr.notes.list.return_value = [mock_note]
-        mock_proj.mergerequests.get.return_value = mock_mr
-        mock_gl.projects.get.return_value = mock_proj
-
-        client = GitLabClient(base_url="https://gitlab.test", private_token="tok", repo_id=1)
-        notes = client.get_pr_notes(42)
-        assert len(notes) == 1
-        assert notes[0]["author"] == "reviewer1"
-        assert notes[0]["body"] == "Please refactor"
 
     @patch("orchestrator.stages.stage5_pr.check_approval_once")
     @patch("orchestrator.stages.stage5_pr.notify_feedback_received")
@@ -618,7 +568,7 @@ class TestS5_4_ProtocolsAndCanonicalAliases:
         cp = Checkpoint(ticket_id="PROJ-200", draft_mr_iid=77, checkpoint_dir=str(tmp_path))
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -679,9 +629,9 @@ class TestS5_4_ProtocolsAndCanonicalAliases:
 
         with patch("orchestrator.main.stage1_context.run") as mock_stage1:
             mock_stage1.return_value = _make_context()
-            with patch("orchestrator.github_issue_client.GitHubIssueClient") as mock_jira_cls:
+            with patch("orchestrator.main.GitHubIssueClient") as mock_jira_cls:
                 mock_jira = mock_jira_cls.return_value
-                with patch("orchestrator.github_client.GitHubClient"):
+                with patch("orchestrator.main.GitHubClient"):
                     with patch("orchestrator.main.LLMClient"):
                         code = run_pipeline("PROJ-200", settings=settings)
 

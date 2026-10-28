@@ -1,6 +1,4 @@
 openai>=1.40
-python-gitlab>=4.5
-atlassian-python-api>=3.41
 pydantic>=2.7
 pydantic-settings>=2.3
 fastapi>=0.111

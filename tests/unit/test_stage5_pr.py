@@ -8,8 +8,9 @@ import pytest
 
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
-from orchestrator.gitlab_gate import GateOutcome, GateResult
-from orchestrator.jira_client import JiraClient, TicketData
+from orchestrator.gate import GateOutcome, GateResult
+from orchestrator.github_issue_client import GitHubIssueClient
+from orchestrator.models import TicketData
 from orchestrator.stages.stage1_context import TicketContext
 from orchestrator.stages.stage4_validation import GateStatus, ValidationResult
 from orchestrator.stages.stage5_pr import Stage5Result, _build_mr_description, run
@@ -89,7 +90,7 @@ class TestStage5Run:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab._project.web_url = "https://gitlab.test/project"
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         result: Stage5Result = run(
             ticket_id="PROJ-100",
@@ -138,7 +139,7 @@ class TestStage5Run:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab._project.web_url = "https://gitlab.test/project"
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         result: Stage5Result = run(
             ticket_id="PROJ-100",
@@ -171,7 +172,7 @@ class TestStage5Run:
         cp = Checkpoint(ticket_id="PROJ-100", draft_mr_iid=None)
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
-        jira = MagicMock(spec=JiraClient)
+        jira = MagicMock(spec=GitHubIssueClient)
 
         with pytest.raises(ValueError, match="draft_mr_iid is not set"):
             run(

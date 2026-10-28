@@ -26,7 +26,7 @@ from orchestrator.code_search import (
     search_repository_for_symbols,
     trace_import_graph,
 )
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 from orchestrator.llm_client import LLMClient
 from orchestrator.repo_resolver import RepoResolver
 

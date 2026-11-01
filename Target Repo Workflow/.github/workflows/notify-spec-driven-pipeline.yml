@@ -1,0 +1,102 @@
+name: Notify Spec-Driven Dev Pipeline
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+# Fires whenever a new issue is opened or labeled in this repository.
+# The pipeline server only processes issues that carry the qualifying label
+# (default: "SpecDrivenDev"), so non-labeled issues are silently ignored.
+
+on:
+  issues:
+    types: [opened, labeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created]
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+# Ensures only ONE pipeline notification dispatch runs at a time per repository.
+# Any concurrent trigger will queue (not cancel) the previous one.
+concurrency:
+  group: spec-driven-pipeline-dispatch
+  cancel-in-progress: false
+
+jobs:
+  notify-pipeline:
+    name: Notify Spec-Driven Dev Pipeline
+    runs-on: ubuntu-latest
+
+    # Only run if the event is an issue (opened/labeled), a PR review, or
+    # an issue comment on a pull request. Skip bot-generated comments.
+    if: |
+      (github.event_name == 'issues') ||
+      (github.event_name == 'pull_request_review') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
+
+    steps:
+      - name: Dispatch to Spec-Driven Pipeline Server
+        id: dispatch
+        env:
+          PIPELINE_SERVER_URL: ${{ secrets.SPEC_PIPELINE_SERVER_URL }}
+          PIPELINE_WEBHOOK_SECRET: ${{ secrets.SPEC_PIPELINE_WEBHOOK_SECRET }}
+        run: |
+          # ── Validate required secret ───────────────────────────────────────
+          if [ -z "$PIPELINE_SERVER_URL" ]; then
+            echo "::error::SPEC_PIPELINE_SERVER_URL secret is not set. Please configure it in this repository's Settings → Secrets."
+            exit 1
+          fi
+
+          # ── Build payload ──────────────────────────────────────────────────
+          PAYLOAD=$(cat "$GITHUB_EVENT_PATH")
+
+          # ── Compute HMAC-SHA256 signature if secret is configured ──────────
+          SIGNATURE_HEADER=""
+          if [ -n "$PIPELINE_WEBHOOK_SECRET" ]; then
+            SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$PIPELINE_WEBHOOK_SECRET" | awk '{print $2}')
+            SIGNATURE_HEADER="X-Hub-Signature-256: sha256=${SIG}"
+          fi
+
+          # ── Determine GitHub event type ────────────────────────────────────
+          EVENT_TYPE="${{ github.event_name }}"
+
+          # ── POST to pipeline webhook ───────────────────────────────────────
+          echo "Dispatching '$EVENT_TYPE' event to pipeline server..."
+
+          HTTP_STATUS=$(curl \
+            --silent \
+            --output /tmp/pipeline_response.json \
+            --write-out "%{http_code}" \
+            --max-time 30 \
+            --request POST \
+            --url "${PIPELINE_SERVER_URL}/webhooks/github" \
+            --header "Content-Type: application/json" \
+            --header "X-GitHub-Event: ${EVENT_TYPE}" \
+            ${SIGNATURE_HEADER:+--header "$SIGNATURE_HEADER"} \
+            --data "$PAYLOAD")
+
+          echo "HTTP Status: $HTTP_STATUS"
+          echo "Pipeline response:"
+          cat /tmp/pipeline_response.json || true
+
+          # ── Fail the step on non-2xx (but allow 409 Conflict = dedup) ──────
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ Pipeline server acknowledged the event."
+            echo "status=queued" >> "$GITHUB_OUTPUT"
+          elif [ "$HTTP_STATUS" -eq 409 ]; then
+            echo "⚠️  Duplicate event — pipeline server already processing this issue."
+            echo "status=duplicate" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Pipeline server returned HTTP $HTTP_STATUS"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Spec-Driven Pipeline Dispatch" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Event | \`${{ github.event_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Issue / PR | #${{ github.event.issue.number || github.event.pull_request.number || 'N/A' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Repository | \`${{ github.repository }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dispatch Status | ${{ steps.dispatch.outputs.status || 'error' }} |" >> "$GITHUB_STEP_SUMMARY"

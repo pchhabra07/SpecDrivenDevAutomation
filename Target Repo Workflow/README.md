@@ -38,3 +38,4 @@ The second file (`spec-driven-dev-ci.yml`) is the CI validation workflow that St
 ## Concurrency
 
 The workflow uses `concurrency: cancel-in-progress: false` so that rapid issue creation is **queued, not dropped**. Combined with `MAX_CONCURRENT_TICKETS=1` on the server, only one pipeline run executes at a time.
+

@@ -162,7 +162,7 @@ def run(
     checkpoint.final_mr_url = mr_url
     checkpoint.gate2_mr_iid = mr_iid
 
-    # Idempotency guard (Edge Case 1): Only promote PR, post Jira lifecycle comment,
+    # Idempotency guard (Edge Case 1): Only promote PR, post lifecycle comment,
     # and send reviewer notifications once per iteration cycle
     already_promoted = (
         checkpoint.gate2_promoted_iteration is not None

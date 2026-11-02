@@ -54,9 +54,9 @@ class RepoResolver:
         Determine the repository target for a ticket.
 
         Matching priority:
-        1. Exact match on JIRA component name (case-insensitive).
-        2. Exact match on JIRA labels (case-insensitive, e.g. "auth-service" or "repo:12345").
-        3. Match on JIRA ticket project key (e.g. "AUTH" from "AUTH-101").
+        1. Exact match on component name (case-insensitive).
+        2. Exact match on issue labels (case-insensitive, e.g. "auth-service" or "repo:12345").
+        3. Match on ticket project prefix (e.g. "AUTH" from "AUTH-101").
         4. Fall back to default_repo_id.
         """
         if not self._mapping:

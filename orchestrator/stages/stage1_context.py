@@ -1,8 +1,7 @@
 """
 Stage 1 — Assemble Ticket Context.
 
-Pulls ticket data from the issue tracker (GitHub Issues or JIRA) and
-the relevant source/test files from the VCS platform (GitHub or GitLab).
+Pulls ticket data from GitHub Issues and the relevant source/test files from GitHub.
 Produces a ``TicketContext`` dataclass consumed by Stage 2.
 
 Implements FR-3, FR-4.
@@ -241,9 +240,9 @@ def run(
     ticket_id : str
         The ticket identifier (e.g. ``PROJ-123`` or ``42``).
     jira : Any
-        Initialised issue tracker client (``GitHubIssueClient`` or ``JiraClient``).
+        Initialised issue tracker client (``GitHubIssueClient``).
     gitlab : Any
-        Initialised VCS client (``GitHubClient`` or ``GitLabClient``).
+        Initialised VCS client (``GitHubClient``).
     llm : LLMClient
         Initialised LLM client (used for relevance ranking).
     checkpoint : Checkpoint

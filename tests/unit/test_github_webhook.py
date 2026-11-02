@@ -162,3 +162,18 @@ class TestGitHubWebhookEndpoint:
         assert r2.status_code == 202
         assert r2.json()["status"] == "duplicate_ignored"
         assert task_queue.qsize() == 1
+    def test_health_endpoint(self):
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert "worker" in data
+        assert "queue_length" in data
+
+    def test_metrics_endpoint(self):
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        text = response.text
+        assert "spec_dev_queue_length" in text
+        assert "spec_dev_tickets_processed_total" in text
+

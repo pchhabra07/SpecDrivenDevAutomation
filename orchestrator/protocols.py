@@ -2,7 +2,7 @@
 Protocols and interfaces for VCS/SCM and Issue Tracker clients.
 
 Provides static type contracts and runtime-checkable interfaces for
-GitHub, GitLab, and JIRA client implementations (S5-4).
+GitHub client implementations (S5-4).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 
 @runtime_checkable
 class IssueTrackerClient(Protocol):
-    """Interface for all issue tracker clients (GitHub Issues, JIRA)."""
+    """Interface for issue tracker clients (GitHub Issues)."""
 
     def get_ticket(self, ticket_id: str) -> Any: ...
 
@@ -31,7 +31,7 @@ class IssueTrackerClient(Protocol):
 
 @runtime_checkable
 class VCSClient(Protocol):
-    """Interface for all VCS/SCM clients (GitHub, GitLab)."""
+    """Interface for VCS/SCM clients (GitHub)."""
 
     def get_default_branch(self) -> str: ...
 

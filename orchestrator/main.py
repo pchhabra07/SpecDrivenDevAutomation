@@ -203,7 +203,7 @@ def run_pipeline(
         return 0
 
     try:
-        # Notify JIRA of pipeline start if starting fresh
+        # Notify GitHub Issue of pipeline start if starting fresh
         if checkpoint.current_stage <= 1:
             jira.transition_ticket(ticket_id, ["In Progress", "Start Progress"])
             jira.post_lifecycle_comment(

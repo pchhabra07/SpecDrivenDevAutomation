@@ -3,7 +3,7 @@ Audit Log Governance & SIEM Shipping (Phase 4).
 
 Provides immutable audit trail persistence by exporting per-ticket JSONL
 logs to either:
-  1. A dedicated, write-restricted VCS audit repository ('git' mode on GitHub or GitLab).
+  1. A dedicated, write-restricted VCS audit repository ('git' mode on GitHub).
   2. An enterprise SIEM or HTTP log ingestion endpoint ('http' mode).
 
 Implements FR-25.
@@ -46,7 +46,7 @@ def ship_audit_log_to_git(
     audit_repo_id: int | None = None,
 ) -> str:
     """
-    Commit the audit log to a dedicated audit repository in GitHub or GitLab.
+    Commit the audit log to a dedicated audit repository in GitHub.
 
     The file is stored under `logs/YYYY/MM/<ticket_id>.jsonl` to ensure
     structured, immutable audit record keeping.

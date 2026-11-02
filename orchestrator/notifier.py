@@ -92,7 +92,7 @@ def build_escalation_message(
 ) -> str:
     """
     Build a human-readable escalation summary used in both Slack and
-    JIRA comments.
+    issue comments.
     """
     passed = test_results.get("passed", 0)
     failed = test_results.get("failed", 0)

@@ -24,7 +24,7 @@ from orchestrator.ci_poller import CIResult, trigger_ci, wait_for_pipeline
 
 logger = logging.getLogger(__name__)
 
-# Expected CI job names across GitLab CI and GitHub Actions
+# Expected CI job names in GitHub Actions CI
 _GATE_JOBS = ("lint", "sast", "dependency-scan", "test-coverage", "quality-gate")
 _JOB_ALIASES: dict[str, tuple[str, ...]] = {
     "lint": ("lint", "eslint"),
@@ -94,7 +94,7 @@ def run(
     code_branch:
         The Git branch with the code changes from Stage 3.
     gitlab:
-        Initialised ``GitHubClient`` or ``GitLabClient``.
+        Initialised ``GitHubClient``.
     checkpoint:
         Current checkpoint (updated with pipeline ID and results).
     audit:
@@ -250,7 +250,7 @@ def _map_gate_statuses(
     ci_result: CIResult,
     sonar_configured: bool,
 ) -> list[GateStatus]:
-    """Map CI job results to structured gate statuses across GitLab and GitHub."""
+    """Map CI job results to structured gate statuses for GitHub Actions."""
     gates: list[GateStatus] = []
 
     for job_name in _GATE_JOBS:

@@ -1,11 +1,9 @@
 """
-FastAPI Webhook Ingestion Service (Phase 3).
+FastAPI Webhook Ingestion Service.
 
-Receives incoming JIRA webhooks, authenticates them with HMAC-SHA256,
-filters for qualifying tickets, deduplicates retransmissions, and enqueues
+Receives incoming GitHub webhooks, authenticates them with HMAC-SHA256,
+filters for qualifying issues, deduplicates retransmissions, and enqueues
 them for serial processing by the orchestrator worker.
-
-Implements FR-1, FR-2, FR-27, and FR-28.
 """
 
 from __future__ import annotations
@@ -128,27 +126,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Spec-Driven Development Webhook Service",
-    description="Event-driven GitHub and JIRA webhook receiver with concurrent task queueing.",
+    description="Event-driven GitHub webhook receiver with concurrent task queueing.",
     version="1.0.0",
     lifespan=lifespan,
 )
-
-
-def verify_jira_hmac(raw_body: bytes, signature_header: str | None, secret: str) -> bool:
-    """
-    Validate HMAC-SHA256 signature from JIRA webhook.
-    Returns True if valid or if secret is unset; False if invalid.
-    """
-    if not secret:
-        return True  # If no secret is configured, authentication is bypassed
-
-    if not signature_header:
-        return False
-
-    # Signature may be 'sha256=<hex>' or just '<hex>'
-    token = signature_header.removeprefix("sha256=").strip()
-    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(token.lower(), expected.lower())
 
 
 def verify_github_hmac(raw_body: bytes, signature_header: str | None, secret: str) -> bool:
@@ -165,79 +146,6 @@ def verify_github_hmac(raw_body: bytes, signature_header: str | None, secret: st
     token = signature_header.removeprefix("sha256=").strip()
     expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(token.lower(), expected.lower())
-
-
-@app.post("/webhooks/jira", status_code=status.HTTP_202_ACCEPTED)
-async def handle_jira_webhook(
-    request: Request,
-    x_hub_signature_256: str | None = Header(None, alias="X-Hub-Signature-256"),
-    secret: str | None = Query(None),
-) -> dict[str, Any]:
-    """
-    Receive JIRA webhook POST notifications for issue creation/update.
-    """
-    settings = get_settings()
-    raw_body = await request.body()
-
-    # 1. HMAC Verification
-    sig = x_hub_signature_256 or secret
-    jira_secret = getattr(settings, "jira_webhook_secret", "")
-    if jira_secret and not verify_jira_hmac(raw_body, sig, jira_secret):
-        logger.warning("Rejected JIRA webhook — invalid HMAC signature.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid HMAC signature",
-        )
-
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload")
-
-    # 2. Extract key fields
-    event_type = payload.get("webhookEvent", "")
-    issue = payload.get("issue", {})
-    fields = issue.get("fields", {})
-    issue_key = issue.get("key", "")
-
-    if not issue_key:
-        logger.info("Ignoring webhook without issue key (event: %s)", event_type)
-        return {"status": "ignored", "reason": "no_issue_key"}
-
-    # 3. Filter by project key
-    project = fields.get("project", {})
-    project_key = project.get("key", "")
-    target_project_key = getattr(settings, "jira_project_key", "")
-    if target_project_key and project_key != target_project_key:
-        logger.debug("Ignoring ticket %s from non-target project %s", issue_key, project_key)
-        return {"status": "ignored", "reason": "project_mismatch"}
-
-    # 4. Filter by qualifying label
-    labels = fields.get("labels", [])
-    if settings.qualifying_label not in labels:
-        logger.debug("Ticket %s does not carry qualifying label '%s'", issue_key, settings.qualifying_label)
-        return {"status": "ignored", "reason": "missing_qualifying_label"}
-
-    # 5. Deduplication check
-    timestamp = payload.get("timestamp", time.time())
-    dedup_key = f"{issue_key}:{timestamp}"
-    _cleanup_old_dedup_entries()
-    if dedup_key in _recent_events:
-        logger.info("Ignoring duplicate webhook for %s (timestamp: %s)", issue_key, timestamp)
-        return {"status": "duplicate_ignored", "ticket_id": issue_key}
-
-    _recent_events[dedup_key] = time.time()
-
-    # 6. Enqueue ticket for serial processing
-    await task_queue.put(issue_key)
-    queue_pos = task_queue.qsize()
-    logger.info("Enqueued %s for processing (queue position: %d)", issue_key, queue_pos)
-
-    return {
-        "status": "queued",
-        "ticket_id": issue_key,
-        "queue_position": queue_pos,
-    }
 
 
 def _find_ticket_for_pr(pr_number: int, checkpoint_dir: str) -> str | None:

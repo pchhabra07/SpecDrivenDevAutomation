@@ -1,7 +1,7 @@
 """
 CI/CD pipeline trigger and polling — thin coordination layer.
 
-Triggers a CI/CD pipeline (GitHub Actions or GitLab CI) for a given branch
+Triggers a CI/CD pipeline (GitHub Actions) for a given branch
 and polls until the pipeline reaches a terminal state (``success``, ``failed``, ``canceled``).
 
 Used by Stage 3 (test-only runs) and Stage 4 (full validation).
@@ -56,7 +56,7 @@ def trigger_ci(
     Parameters
     ----------
     client:
-        Initialised ``GitHubClient`` or ``GitLabClient``.
+        Initialised ``GitHubClient``.
     branch:
         The Git branch to run the pipeline on.
     variables:
@@ -94,7 +94,7 @@ def wait_for_pipeline(
     Parameters
     ----------
     client:
-        Initialised ``GitHubClient`` or ``GitLabClient``.
+        Initialised ``GitHubClient``.
     pipeline_id:
         The pipeline ID to monitor.
     poll_interval_seconds:

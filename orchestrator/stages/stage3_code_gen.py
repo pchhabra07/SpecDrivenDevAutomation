@@ -1040,7 +1040,7 @@ def _handle_escalation(
     mr_iid: int | None,
     audit: AuditLogger,
 ) -> None:
-    """Execute the escalation path: label MR, JIRA comment, notify."""
+    """Execute the escalation path: label PR, post comment, notify."""
     audit.log(
         stage=3,
         event_type="escalation_triggered",
@@ -1067,11 +1067,11 @@ def _handle_escalation(
         mr_url=mr_url,
     )
 
-    # Post JIRA comment.
+    # Post issue comment.
     try:
         jira.post_comment(ticket_id, message)
     except Exception as exc:
-        logger.error("Failed to post JIRA comment for %s: %s", ticket_id, exc)
+        logger.error("Failed to post issue comment for %s: %s", ticket_id, exc)
 
     # Slack notification.
     notify_slack(slack_webhook_url, message)

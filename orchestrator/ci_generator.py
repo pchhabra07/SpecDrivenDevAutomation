@@ -180,8 +180,6 @@ def has_target_ci_workflow(
                 normalized.endswith(".yml") or normalized.endswith(".yaml")
             ):
                 return True, normalized
-            if normalized == ".gitlab-ci.yml":
-                return True, normalized
 
     # 2. Query VCS client tree
     try:

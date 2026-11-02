@@ -1,7 +1,7 @@
 """
 Concurrent Worker Pool & Task Scheduling (Phase 5).
 
-Provides parallel execution of multiple JIRA tickets with shared rate-limit
+Provides parallel execution of multiple tickets/issues with shared rate-limit
 budgeting, worker health telemetry, and graceful error isolation.
 
 Implements Phase 5 concurrency scaling while respecting provider rate caps.

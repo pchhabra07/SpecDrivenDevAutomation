@@ -83,8 +83,13 @@ class TestAuditShipper:
 
     def test_ship_audit_log_local_mode(self, temp_audit_file, tmp_path):
         settings = Settings(
-            github_token="ghp_test",
-            github_repo="org/repo",
+            jira_base_url="https://jira.test",
+            jira_api_token="token",
+            jira_user_email="user@test.com",
+            jira_project_key="PROJ",
+            gitlab_base_url="https://gitlab.test",
+            gitlab_api_token="token",
+            gitlab_repo_id=123,
             nim_api_key="token",
             nim_base_url="https://nim.test",
             audit_shipping_mode="none",
@@ -96,8 +101,13 @@ class TestAuditShipper:
 
     def test_ship_audit_log_missing_file(self, tmp_path):
         settings = Settings(
-            github_token="ghp_test",
-            github_repo="org/repo",
+            jira_base_url="https://jira.test",
+            jira_api_token="token",
+            jira_user_email="user@test.com",
+            jira_project_key="PROJ",
+            gitlab_base_url="https://gitlab.test",
+            gitlab_api_token="token",
+            gitlab_repo_id=123,
             nim_api_key="token",
             nim_base_url="https://nim.test",
             audit_shipping_mode="none",

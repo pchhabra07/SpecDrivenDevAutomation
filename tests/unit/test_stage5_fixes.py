@@ -21,6 +21,8 @@ from orchestrator.checkpoint import Checkpoint
 from orchestrator.config import Settings
 from orchestrator.exceptions import GatePendingError
 from orchestrator.gate import GateOutcome, GateResult
+from orchestrator.gitlab_client import GitLabClient
+from orchestrator.jira_client import JiraClient
 from orchestrator.github_client import GitHubClient
 from orchestrator.github_issue_client import GitHubIssueClient
 from orchestrator.models import TicketData
@@ -94,7 +96,7 @@ class TestS5_1_NonBlockingGate2:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=GitHubIssueClient)
+        jira = MagicMock(spec=JiraClient)
 
         with pytest.raises(GatePendingError) as exc_info:
             stage5_run(
@@ -147,7 +149,7 @@ class TestS5_1_NonBlockingGate2:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=GitHubIssueClient)
+        jira = MagicMock(spec=JiraClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -192,7 +194,7 @@ class TestS5_1_NonBlockingGate2:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=GitHubIssueClient)
+        jira = MagicMock(spec=JiraClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -235,14 +237,19 @@ class TestS5_1_NonBlockingGate2:
             checkpoint_dir=str(tmp_path),
             audit_dir=str(tmp_path / "audit"),
             blocking_gates=False,
-            github_token="ghp_test",
-            github_repo="org/repo",
+            jira_base_url="https://jira.test",
+            jira_api_token="token",
+            jira_user_email="user@test.com",
+            jira_project_key="PROJ",
+            gitlab_base_url="https://gitlab.test",
+            gitlab_api_token="gltoken",
+            gitlab_repo_id=123,
         )
 
         with patch("orchestrator.main.stage1_context.run") as mock_stage1:
             mock_stage1.return_value = _make_context()
-            with patch("orchestrator.main.GitHubIssueClient"):
-                with patch("orchestrator.main.GitHubClient"):
+            with patch("orchestrator.main.JiraClient"):
+                with patch("orchestrator.main.GitLabClient"):
                     with patch("orchestrator.main.LLMClient"):
                         code = run_pipeline("PROJ-200", settings=settings)
 
@@ -270,7 +277,7 @@ class TestS5_1_StaleGateTimeoutAndIdempotency:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=GitHubIssueClient)
+        jira = MagicMock(spec=JiraClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -363,7 +370,7 @@ class TestS5_1_StaleGateTimeoutAndIdempotency:
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
         gitlab.get_pr_url.return_value = "https://github.com/org/repo/pull/77"
-        jira = MagicMock(spec=GitHubIssueClient)
+        jira = MagicMock(spec=JiraClient)
 
         with pytest.raises(GatePendingError):
             stage5_run(
@@ -568,7 +575,7 @@ class TestS5_2_CanonicalPRUrl:
         cp = Checkpoint(ticket_id="PROJ-200", draft_mr_iid=77, checkpoint_dir=str(tmp_path))
         audit = MagicMock(spec=AuditLogger)
         gitlab = MagicMock()
-        jira = MagicMock(spec=GitHubIssueClient)
+        jira = MagicMock(spec=JiraClient)
 
         result = stage5_run(
             ticket_id="PROJ-200",
@@ -623,15 +630,20 @@ class TestS5_2_CanonicalPRUrl:
             checkpoint_dir=str(tmp_path),
             audit_dir=str(tmp_path / "audit"),
             blocking_gates=False,
-            github_token="ghp_test",
-            github_repo="org/repo",
+            jira_base_url="https://jira.test",
+            jira_api_token="token",
+            jira_user_email="user@test.com",
+            jira_project_key="PROJ",
+            gitlab_base_url="https://gitlab.test",
+            gitlab_api_token="gltoken",
+            gitlab_repo_id=123,
         )
 
         with patch("orchestrator.main.stage1_context.run") as mock_stage1:
             mock_stage1.return_value = _make_context()
-            with patch("orchestrator.main.GitHubIssueClient") as mock_jira_cls:
+            with patch("orchestrator.main.JiraClient") as mock_jira_cls:
                 mock_jira = mock_jira_cls.return_value
-                with patch("orchestrator.main.GitHubClient"):
+                with patch("orchestrator.main.GitLabClient"):
                     with patch("orchestrator.main.LLMClient"):
                         code = run_pipeline("PROJ-200", settings=settings)
 

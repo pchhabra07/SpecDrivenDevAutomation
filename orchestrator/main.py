@@ -25,8 +25,8 @@ from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.config import Settings, get_settings
 from orchestrator.exceptions import GatePendingError
-from orchestrator.github_client import GitHubClient
-from orchestrator.github_issue_client import GitHubIssueClient
+from orchestrator.gitlab_client import GitLabClient
+from orchestrator.jira_client import JiraClient
 from orchestrator.llm_client import LLMClient
 from orchestrator.rate_limiter import RateLimiter
 from orchestrator.repo_resolver import RepoResolver
@@ -95,16 +95,15 @@ def run_pipeline(
 
     rate_limiter = RateLimiter(max_calls=settings.rate_limit_cap)
 
-    issue_client = GitHubIssueClient(
-        token=settings.github_token,
-        repo=settings.github_repo,
-        base_url=settings.github_base_url,
+    issue_client = JiraClient(
+        base_url=settings.jira_base_url,
+        email=settings.jira_user_email,
+        api_token=settings.jira_api_token,
     )
-    vcs_client = GitHubClient(
-        token=settings.github_token,
-        repo=settings.github_repo,
-        base_url=settings.github_base_url,
-        workflow_file=settings.github_workflow_file or None,
+    vcs_client = GitLabClient(
+        base_url=settings.gitlab_base_url,
+        private_token=settings.gitlab_api_token,
+        repo_id=settings.gitlab_repo_id,
     )
     jira = issue_client
     gitlab = vcs_client
@@ -203,7 +202,7 @@ def run_pipeline(
         return 0
 
     try:
-        # Notify GitHub Issue of pipeline start if starting fresh
+        # Notify JIRA of pipeline start if starting fresh
         if checkpoint.current_stage <= 1:
             jira.transition_ticket(ticket_id, ["In Progress", "Start Progress"])
             jira.post_lifecycle_comment(

@@ -1,0 +1,125 @@
+# ─────────────────────────────────────────────────────────────────────
+# Spec-Driven Development Pipeline — GitLab CI Validation Template
+# Add this file to your target GitLab repository as `.gitlab-ci.yml`.
+#
+# The orchestrator triggers this pipeline in two modes:
+#   1. TEST_ONLY=true  (Stage 3): runs only the 'test' stage.
+#   2. Full pipeline   (Stage 4): runs all stages sequentially.
+# ─────────────────────────────────────────────────────────────────────
+
+stages:
+  - test
+  - lint
+  - sast
+  - dependency-scan
+  - test-coverage
+  - quality-gate
+
+# ── Variables ──────────────────────────────────────────────────────────
+variables:
+  # Override TEST_PATTERN to run a subset of tests (default: all).
+  TEST_PATTERN: ""
+  # Set TEST_ONLY=true to skip lint/sast/coverage/quality-gate stages.
+  TEST_ONLY: "false"
+
+# ── Stage: test ────────────────────────────────────────────────────────
+test:
+  stage: test
+  image: node:20-slim
+  script:
+    - npm ci --prefer-offline || npm install --legacy-peer-deps || true
+    - |
+      if [ -n "$TEST_PATTERN" ]; then
+        npx jest --testPathPattern="$TEST_PATTERN" --json --outputFile=jest-results.json
+      else
+        npx jest --json --outputFile=jest-results.json || pytest --junitxml=pytest-results.xml || true
+      fi
+  artifacts:
+    when: always
+    paths:
+      - jest-results.json
+      - pytest-results.xml
+    expire_in: 7 days
+
+# ── Stage: lint ────────────────────────────────────────────────────────
+lint:
+  stage: lint
+  image: node:20-slim
+  rules:
+    - if: '$TEST_ONLY == "true"'
+      when: never
+    - when: on_success
+  script:
+    - npm ci --prefer-offline || true
+    - npx eslint . --max-warnings=50 || true
+  artifacts:
+    when: always
+    paths:
+      - eslint-report.json
+    expire_in: 7 days
+
+# ── Stage: sast ────────────────────────────────────────────────────────
+sast:
+  stage: sast
+  image: returntocorp/semgrep:latest
+  rules:
+    - if: '$TEST_ONLY == "true"'
+      when: never
+    - when: on_success
+  script:
+    - semgrep --config=auto --json --output semgrep-report.json . || true
+  artifacts:
+    when: always
+    paths:
+      - semgrep-report.json
+    expire_in: 7 days
+
+# ── Stage: dependency-scan ─────────────────────────────────────────────
+dependency-scan:
+  stage: dependency-scan
+  image: aquasec/trivy:latest
+  rules:
+    - if: '$TEST_ONLY == "true"'
+      when: never
+    - when: on_success
+  script:
+    - trivy fs --format json --output trivy-report.json . || true
+  artifacts:
+    when: always
+    paths:
+      - trivy-report.json
+    expire_in: 7 days
+
+# ── Stage: test-coverage ───────────────────────────────────────────────
+test-coverage:
+  stage: test-coverage
+  image: node:20-slim
+  rules:
+    - if: '$TEST_ONLY == "true"'
+      when: never
+    - when: on_success
+  script:
+    - npx jest --coverage --coverageReporters=lcov --coverageReporters=text || pytest --cov=. || true
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 7 days
+
+# ── Stage: quality-gate ────────────────────────────────────────────────
+quality-gate:
+  stage: quality-gate
+  image: sonarsource/sonar-scanner-cli:latest
+  rules:
+    - if: '$TEST_ONLY == "true"'
+      when: never
+    - if: '$SONAR_HOST_URL == ""'
+      when: never
+    - when: on_success
+  script:
+    - >
+      sonar-scanner
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.login=$SONAR_TOKEN
+      -Dsonar.sources=. || true
+

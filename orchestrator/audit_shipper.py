@@ -150,7 +150,7 @@ def ship_audit_log(
     mode = settings.audit_shipping_mode.lower()
 
     if mode == "git":
-        target_audit_repo = settings.github_audit_repo
+        target_audit_repo = getattr(settings, "audit_gitlab_repo_id", None) or getattr(settings, "github_audit_repo", None)
         if not target_audit_repo:
             logger.warning("audit_shipping_mode is 'git' but audit repo is unset.")
             return {"status": "failed", "reason": "missing_audit_repo", "sha256": sha256}

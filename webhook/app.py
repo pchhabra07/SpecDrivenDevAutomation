@@ -1,9 +1,9 @@
 """
 FastAPI Webhook Ingestion Service.
 
-Receives incoming GitHub webhooks, authenticates them with HMAC-SHA256,
-filters for qualifying issues, deduplicates retransmissions, and enqueues
-them for serial processing by the orchestrator worker.
+Receives incoming JIRA and GitLab webhooks, authenticates them with HMAC-SHA256
+or token headers, filters for qualifying tickets, deduplicates retransmissions,
+and enqueues them for serial processing by the orchestrator worker.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, st
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from orchestrator.config import get_settings
+from orchestrator.concurrency import ConcurrentWorkerPool
 from orchestrator.main import run_pipeline
 
 logger = logging.getLogger("webhook")
@@ -32,8 +33,6 @@ task_queue: asyncio.Queue[str] = asyncio.Queue()
 # In-memory deduplication cache: {event_id: timestamp}
 _recent_events: dict[str, float] = {}
 _DEDUP_TTL_SECONDS = 600.0  # 10 minutes
-
-from orchestrator.concurrency import ConcurrentWorkerPool
 
 # Concurrent worker pool instance
 worker_pool: ConcurrentWorkerPool | None = None
@@ -96,14 +95,11 @@ async def lifespan(app: FastAPI):
         "httpcore.http11",
         "openai",
         "openai._base_client",
-        "github",
-        "github.Requester",
         "git",
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     settings = get_settings()
-    # In server/webhook mode, gates must not block worker threads (S2-1, S5-1)
     settings.blocking_gates = False
     worker_pool = ConcurrentWorkerPool(
         queue=task_queue,
@@ -126,19 +122,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Spec-Driven Development Webhook Service",
-    description="Event-driven GitHub webhook receiver with concurrent task queueing.",
+    description="Event-driven JIRA and GitLab webhook receiver with concurrent task queueing.",
     version="1.0.0",
     lifespan=lifespan,
 )
 
 
-def verify_github_hmac(raw_body: bytes, signature_header: str | None, secret: str) -> bool:
+def verify_jira_hmac(raw_body: bytes, signature_header: str | None, secret: str) -> bool:
     """
-    Validate HMAC-SHA256 signature from GitHub webhook (X-Hub-Signature-256).
+    Validate HMAC-SHA256 signature from JIRA webhook.
     Returns True if valid or if secret is unset; False if invalid.
     """
     if not secret:
-        return True  # If no secret is configured, authentication is bypassed
+        return True
 
     if not signature_header:
         return False
@@ -148,11 +144,81 @@ def verify_github_hmac(raw_body: bytes, signature_header: str | None, secret: st
     return hmac.compare_digest(token.lower(), expected.lower())
 
 
+@app.post("/webhooks/jira", status_code=status.HTTP_202_ACCEPTED)
+async def handle_jira_webhook(
+    request: Request,
+    x_hub_signature_256: str | None = Header(None, alias="X-Hub-Signature-256"),
+    secret: str | None = Query(None),
+) -> dict[str, Any]:
+    """
+    Receive JIRA webhook POST notifications for issue creation/update.
+    """
+    settings = get_settings()
+    raw_body = await request.body()
+
+    # 1. HMAC Verification
+    sig = x_hub_signature_256 or secret
+    jira_secret = settings.jira_webhook_secret
+    if jira_secret and not verify_jira_hmac(raw_body, sig, jira_secret):
+        logger.warning("Rejected JIRA webhook — invalid HMAC signature.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid HMAC signature",
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload")
+
+    # 2. Extract key fields
+    event_type = payload.get("webhookEvent", "")
+    issue = payload.get("issue", {})
+    fields = issue.get("fields", {})
+    issue_key = issue.get("key", "")
+
+    if not issue_key:
+        logger.info("Ignoring webhook without issue key (event: %s)", event_type)
+        return {"status": "ignored", "reason": "no_issue_key"}
+
+    # 3. Filter by project key
+    project = fields.get("project", {})
+    project_key = project.get("key", "")
+    target_project_key = settings.jira_project_key
+    if target_project_key and project_key != target_project_key:
+        logger.debug("Ignoring ticket %s from non-target project %s", issue_key, project_key)
+        return {"status": "ignored", "reason": "project_mismatch"}
+
+    # 4. Filter by qualifying label
+    labels = fields.get("labels", [])
+    if settings.qualifying_label not in labels:
+        logger.debug("Ticket %s does not carry qualifying label '%s'", issue_key, settings.qualifying_label)
+        return {"status": "ignored", "reason": "missing_qualifying_label"}
+
+    # 5. Deduplication check
+    timestamp = payload.get("timestamp", time.time())
+    dedup_key = f"{issue_key}:{timestamp}"
+    _cleanup_old_dedup_entries()
+    if dedup_key in _recent_events:
+        logger.info("Ignoring duplicate webhook for %s (timestamp: %s)", issue_key, timestamp)
+        return {"status": "duplicate_ignored", "ticket_id": issue_key}
+
+    _recent_events[dedup_key] = time.time()
+
+    # 6. Enqueue ticket for serial processing
+    await task_queue.put(issue_key)
+    queue_pos = task_queue.qsize()
+    logger.info("Enqueued %s for processing (queue position: %d)", issue_key, queue_pos)
+
+    return {
+        "status": "queued",
+        "ticket_id": issue_key,
+        "queue_position": queue_pos,
+    }
+
+
 def _find_ticket_for_pr(pr_number: int, checkpoint_dir: str) -> str | None:
     """Scan checkpoint files to find a ticket waiting on the given PR/MR number (S2-1)."""
-    import json
-    from pathlib import Path
-
     cp_dir = Path(checkpoint_dir)
     if not cp_dir.is_dir():
         return None
@@ -172,150 +238,47 @@ def _find_ticket_for_pr(pr_number: int, checkpoint_dir: str) -> str | None:
     return None
 
 
-@app.post("/webhooks/github", status_code=status.HTTP_202_ACCEPTED)
-async def handle_github_webhook(
+@app.post("/webhooks/gitlab", status_code=status.HTTP_200_OK)
+async def handle_gitlab_webhook(
     request: Request,
-    x_hub_signature_256: str | None = Header(None, alias="X-Hub-Signature-256"),
-    x_github_event: str | None = Header(None, alias="X-GitHub-Event"),
+    x_gitlab_token: str | None = Header(None, alias="X-Gitlab-Token"),
 ) -> dict[str, Any]:
     """
-    Receive GitHub webhook POST notifications for issues or pull requests.
+    GitLab webhook endpoint for MR updates and approval events (S2-1).
     """
     settings = get_settings()
-    raw_body = await request.body()
+    if settings.gitlab_webhook_secret and x_gitlab_token != settings.gitlab_webhook_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid GitLab token")
 
-    # 1. HMAC Verification
-    secret = settings.github_webhook_secret
-    if secret and not verify_github_hmac(raw_body, x_hub_signature_256, secret):
-        logger.warning("Rejected GitHub webhook — invalid HMAC signature.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid HMAC signature",
-        )
+    payload = await request.json()
+    object_kind = payload.get("object_kind")
+    logger.info("Received GitLab webhook: %s", object_kind)
 
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload")
+    # Re-enqueue ticket waiting on MR approval or feedback
+    if object_kind in ("merge_request", "note"):
+        mr = payload.get("merge_request", {}) or payload.get("object_attributes", {})
+        mr_iid = mr.get("iid") or payload.get("merge_request", {}).get("iid")
+        if mr_iid:
+            note_body = payload.get("object_attributes", {}).get("note", "")
+            if "<!-- spec-driven-bot -->" in note_body or "[spec-driven]" in note_body:
+                return {"status": "ignored", "reason": "bot_comment"}
 
-    # If ping event
-    if x_github_event == "ping":
-        return {"status": "pong"}
-
-    # S2-1: Handle pull_request_review events (e.g. human approved or requested changes)
-    if x_github_event == "pull_request_review":
-        action = payload.get("action", "")
-        pr = payload.get("pull_request", {})
-        pr_number = pr.get("number")
-        if action in ("submitted", "dismissed", "edited") and pr_number:
-            review_id = payload.get("review", {}).get("id", "")
-            dedup_key = f"github_review:{pr_number}:{action}:{review_id}"
-            _cleanup_old_dedup_entries()
-            if dedup_key in _recent_events:
-                logger.info("Ignoring duplicate review webhook for PR #%s", pr_number)
-                return {"status": "duplicate_ignored", "pr_number": pr_number}
-            _recent_events[dedup_key] = time.time()
-
-            ticket_id = _find_ticket_for_pr(pr_number, settings.checkpoint_dir)
+            ticket_id = _find_ticket_for_pr(int(mr_iid), settings.checkpoint_dir)
             if ticket_id:
                 await task_queue.put(ticket_id)
                 queue_pos = task_queue.qsize()
                 logger.info(
-                    "Re-enqueued ticket %s after PR #%d review event (queue position: %d)",
-                    ticket_id, pr_number, queue_pos,
+                    "Re-enqueued ticket %s after GitLab MR/Note event for MR !%s (queue position: %d)",
+                    ticket_id, mr_iid, queue_pos,
                 )
                 return {
                     "status": "requeued",
                     "ticket_id": ticket_id,
-                    "pr_number": pr_number,
+                    "mr_iid": mr_iid,
                     "queue_position": queue_pos,
                 }
-            logger.info("No checkpoint found waiting for PR #%d", pr_number)
-            return {"status": "ignored", "reason": "no_matching_checkpoint"}
-        return {"status": "ignored", "reason": f"unhandled_review_action_{action}"}
 
-    # S2-1: Handle issue_comment events on pull requests (e.g. reviewer commented on PR)
-    if x_github_event == "issue_comment" and payload.get("issue", {}).get("pull_request"):
-        action = payload.get("action", "")
-        comment = payload.get("comment", {})
-        body = comment.get("body", "")
-        if "<!-- spec-driven-bot -->" in body or "[spec-driven]" in body:
-            return {"status": "ignored", "reason": "bot_comment"}
-        pr_number = payload.get("issue", {}).get("number")
-        if action == "created" and pr_number:
-            comment_id = comment.get("id", "")
-            dedup_key = f"github_comment:{pr_number}:{comment_id}"
-            _cleanup_old_dedup_entries()
-            if dedup_key in _recent_events:
-                return {"status": "duplicate_ignored", "pr_number": pr_number}
-            _recent_events[dedup_key] = time.time()
-
-            ticket_id = _find_ticket_for_pr(pr_number, settings.checkpoint_dir)
-            if ticket_id:
-                await task_queue.put(ticket_id)
-                queue_pos = task_queue.qsize()
-                logger.info(
-                    "Re-enqueued ticket %s after PR #%d comment event (queue position: %d)",
-                    ticket_id, pr_number, queue_pos,
-                )
-                return {
-                    "status": "requeued",
-                    "ticket_id": ticket_id,
-                    "pr_number": pr_number,
-                    "queue_position": queue_pos,
-                }
-            return {"status": "ignored", "reason": "no_matching_checkpoint"}
-
-    # Filter for 'issues' event
-    if x_github_event and x_github_event != "issues":
-        logger.info("Ignoring GitHub event '%s'", x_github_event)
-        return {"status": "ignored", "reason": f"unhandled_event_{x_github_event}"}
-
-    action = payload.get("action", "")
-    issue = payload.get("issue", {})
-    if not issue:
-        return {"status": "ignored", "reason": "no_issue"}
-
-    issue_number = issue.get("number")
-    if not issue_number:
-        return {"status": "ignored", "reason": "no_issue_number"}
-
-    ticket_id = str(issue_number)
-
-    # Check repository if configured
-    repository = payload.get("repository", {})
-    repo_full_name = repository.get("full_name", "")
-    if settings.github_repo and repo_full_name and settings.github_repo.lower() != repo_full_name.lower():
-        logger.debug("Ignoring issue from non-target repo %s", repo_full_name)
-        return {"status": "ignored", "reason": "repo_mismatch"}
-
-    # Check qualifying label
-    raw_labels = issue.get("labels", [])
-    labels = [lbl.get("name") if isinstance(lbl, dict) else str(lbl) for lbl in raw_labels]
-    if settings.qualifying_label and settings.qualifying_label not in labels:
-        logger.debug("GitHub Issue #%s does not carry qualifying label '%s'", ticket_id, settings.qualifying_label)
-        return {"status": "ignored", "reason": "missing_qualifying_label"}
-
-    # Deduplication check
-    updated_at = issue.get("updated_at") or payload.get("timestamp", time.time())
-    dedup_key = f"github:{ticket_id}:{action}:{updated_at}"
-    _cleanup_old_dedup_entries()
-    if dedup_key in _recent_events:
-        logger.info("Ignoring duplicate GitHub webhook for issue #%s", ticket_id)
-        return {"status": "duplicate_ignored", "ticket_id": ticket_id}
-
-    _recent_events[dedup_key] = time.time()
-
-    # Enqueue issue number for processing
-    await task_queue.put(ticket_id)
-    queue_pos = task_queue.qsize()
-    logger.info("Enqueued GitHub Issue #%s for processing (queue position: %d)", ticket_id, queue_pos)
-
-    return {
-        "status": "queued",
-        "ticket_id": ticket_id,
-        "queue_position": queue_pos,
-    }
+    return {"status": "received", "event": object_kind}
 
 
 @app.get("/health")

@@ -17,34 +17,31 @@ from typing_extensions import Self
 class Settings(BaseSettings):
     """All orchestrator configuration — loaded from env vars."""
 
-    # ── GitHub ──────────────────────────────────────────────────────────
-    github_token: str = Field(
+    # ── JIRA ────────────────────────────────────────────────────────────
+    jira_base_url: str = Field("", description="JIRA instance root URL")
+    jira_api_token: str = Field("", description="JIRA API token (secret)")
+    jira_user_email: str = Field("", description="JIRA user email for basic auth")
+    jira_project_key: str = Field("", description="JIRA project key filter")
+    jira_webhook_secret: str = Field(
         "",
-        description="GitHub Personal Access Token or GitHub App Token (secret)",
-    )
-    github_repo: str = Field(
-        "",
-        description="Target GitHub repository in 'owner/repo' format",
-    )
-    github_base_url: str = Field(
-        "https://api.github.com",
-        description="GitHub REST API base URL (override for GitHub Enterprise)",
-    )
-    github_webhook_secret: str = Field(
-        "",
-        description="Shared secret for validating incoming GitHub webhooks via HMAC-SHA256",
-    )
-    github_audit_repo: str = Field(
-        "",
-        description="GitHub repository in 'owner/repo' format for audit log shipping",
-    )
-    github_workflow_file: str = Field(
-        "",
-        description="Optional custom workflow file name in .github/workflows/ (defaults to <repo_name>-ci.yml)",
+        description="Shared secret for validating incoming JIRA webhooks via HMAC-SHA256",
     )
     qualifying_label: str = Field(
         "SpecDrivenDev",
         description="Only tickets carrying this label are eligible for automation",
+    )
+
+    # ── GitLab ──────────────────────────────────────────────────────────
+    gitlab_base_url: str = Field("https://gitlab.com", description="GitLab instance URL")
+    gitlab_api_token: str = Field("", description="GitLab personal/project token (secret)")
+    gitlab_repo_id: int = Field(0, description="Target GitLab project / repository numeric ID")
+    gitlab_webhook_secret: str = Field(
+        "",
+        description="Secret token to validate incoming GitLab webhooks",
+    )
+    audit_gitlab_repo_id: int | None = Field(
+        None,
+        description="Optional dedicated GitLab audit repository ID",
     )
 
     # ── NVIDIA NIM / LLM ───────────────────────────────────────────────
@@ -189,19 +186,24 @@ class Settings(BaseSettings):
     }
 
     @model_validator(mode="after")
-    def validate_github_credentials(self) -> Self:
-        if self.github_repo:
-            repo = self.github_repo.strip()
-            if "github.com" in repo:
-                repo = repo.split("github.com", 1)[1].lstrip("/:").removesuffix(".git")
-            self.github_repo = repo
-        if self.github_audit_repo:
-            audit_repo = self.github_audit_repo.strip()
-            if "github.com" in audit_repo:
-                audit_repo = audit_repo.split("github.com", 1)[1].lstrip("/:").removesuffix(".git")
-            self.github_audit_repo = audit_repo
-        if not self.github_token or not self.github_repo:
-            raise ValueError("GITHUB_TOKEN and GITHUB_REPO are required.")
+    def validate_platform_credentials(self) -> Self:
+        jira_fields = [self.jira_base_url, self.jira_api_token, self.jira_user_email, self.jira_project_key]
+        any_jira = any(bool(f) for f in jira_fields)
+        all_jira = all(bool(f) for f in jira_fields)
+        if any_jira and not all_jira:
+            raise ValueError(
+                "Incomplete JIRA credentials: JIRA_BASE_URL, JIRA_API_TOKEN, JIRA_USER_EMAIL, "
+                "and JIRA_PROJECT_KEY must all be provided if JIRA is configured."
+            )
+
+        gitlab_fields = [self.gitlab_base_url, self.gitlab_api_token, self.gitlab_repo_id]
+        any_gitlab = any(bool(f) for f in gitlab_fields)
+        all_gitlab = all(bool(f) for f in gitlab_fields)
+        if any_gitlab and not all_gitlab:
+            raise ValueError(
+                "Incomplete GitLab credentials: GITLAB_BASE_URL, GITLAB_API_TOKEN, "
+                "and GITLAB_REPO_ID must all be provided if GitLab is configured."
+            )
         return self
 
 

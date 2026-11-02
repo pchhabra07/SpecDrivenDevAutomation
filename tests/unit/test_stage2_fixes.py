@@ -258,8 +258,8 @@ class TestWebhookReEnqueue:
         assert _find_ticket_for_pr(99, str(tmp_path)) is None
 
     @pytest.mark.asyncio
-    async def test_github_pull_request_review_webhook_reenqueues(self, tmp_path):
-        from webhook.app import handle_github_webhook, task_queue
+    async def test_gitlab_merge_request_webhook_reenqueues(self, tmp_path):
+        from webhook.app import handle_gitlab_webhook, task_queue
 
         cp_file = tmp_path / "TICK-50.json"
         cp_file.write_text(
@@ -277,22 +277,20 @@ class TestWebhookReEnqueue:
         mock_request = AsyncMock()
         mock_request.body.return_value = b"{}"
         mock_request.json.return_value = {
-            "action": "submitted",
-            "pull_request": {"number": 123},
-            "review": {"id": 999, "state": "approved"},
+            "object_kind": "merge_request",
+            "merge_request": {"iid": 123},
         }
 
         with patch("webhook.app.get_settings") as mock_settings:
-            settings = Settings(
+            settings = Settings.model_construct(
                 checkpoint_dir=str(tmp_path),
-                github_webhook_secret="",
+                gitlab_webhook_secret="",
             )
             mock_settings.return_value = settings
 
-            res = await handle_github_webhook(
+            res = await handle_gitlab_webhook(
                 request=mock_request,
-                x_hub_signature_256=None,
-                x_github_event="pull_request_review",
+                x_gitlab_token=None,
             )
 
             assert res["status"] == "requeued"

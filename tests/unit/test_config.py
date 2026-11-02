@@ -13,8 +13,13 @@ from orchestrator.config import Settings
 
 # Minimum set of env vars required to instantiate Settings without error.
 _REQUIRED_ENV = {
-    "GITHUB_TOKEN": "ghp_1234567890abcdef",
-    "GITHUB_REPO": "pchhabra07/SpecDrivenDevAutomation",
+    "JIRA_BASE_URL": "https://jira.test",
+    "JIRA_API_TOKEN": "token123",
+    "JIRA_USER_EMAIL": "user@test.com",
+    "JIRA_PROJECT_KEY": "PROJ",
+    "GITLAB_BASE_URL": "https://gitlab.test",
+    "GITLAB_API_TOKEN": "gltoken",
+    "GITLAB_REPO_ID": "12345",
     "NIM_API_KEY": "nim-key",
     "NIM_BASE_URL": "https://integrate.api.nvidia.com/v1",
 }
@@ -27,8 +32,9 @@ class TestSettings:
         """Settings should instantiate when all required vars are present."""
         with patch.dict(os.environ, _REQUIRED_ENV, clear=False):
             s = Settings()
-            assert s.github_token == "ghp_1234567890abcdef"
-            assert s.github_repo == "pchhabra07/SpecDrivenDevAutomation"
+            assert s.jira_base_url == "https://jira.test"
+            assert s.jira_api_token == "token123"
+            assert s.gitlab_repo_id == 12345
             assert s.nim_api_key == "nim-key"
 
     def test_defaults_are_applied(self):
@@ -45,7 +51,7 @@ class TestSettings:
     def test_missing_required_raises(self):
         """Omitting a required field should raise a validation error."""
         incomplete = dict(_REQUIRED_ENV)
-        del incomplete["GITHUB_TOKEN"]
+        del incomplete["JIRA_API_TOKEN"]
         with patch.dict(os.environ, incomplete, clear=True):
             with pytest.raises(Exception):
                 Settings(_env_file=None)
@@ -59,19 +65,7 @@ class TestSettings:
             "MAX_CODE_ITERATIONS": "3",
         }
         with patch.dict(os.environ, overrides, clear=False):
-            s = Settings()
+            s = Settings(_env_file=None)
             assert s.qualifying_label == "CustomLabel"
             assert s.rate_limit_cap == 10
             assert s.max_code_iterations == 3
-
-    def test_repo_normalization(self):
-        """Full GitHub URLs should be normalized to owner/repo format."""
-        github_env = {
-            **_REQUIRED_ENV,
-            "GITHUB_REPO": "https://github.com/pchhabra07/SpecDrivenDevAutomation.git",
-            "GITHUB_AUDIT_REPO": "git@github.com:pchhabra07/audit-log.git",
-        }
-        with patch.dict(os.environ, github_env, clear=True):
-            s = Settings(_env_file=None)
-            assert s.github_repo == "pchhabra07/SpecDrivenDevAutomation"
-            assert s.github_audit_repo == "pchhabra07/audit-log"

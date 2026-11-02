@@ -1,41 +1,53 @@
-# Target Repo Workflow — Setup Instructions
+# Target Repo Workflow — GitLab & JIRA Setup Instructions
 
-This folder contains a GitHub Actions workflow that you add to **any target repository** you want the Spec-Driven Dev pipeline to automatically process.
+This folder contains the target repository configuration for the **GitLab + JIRA** version of the Spec-Driven Development Pipeline.
 
-## What It Does
+---
 
-When you add this workflow to a target repo, it will:
-- **Trigger** whenever a new issue is opened or labeled in that repository.
-- **Send a signed POST request** to your Spec-Driven pipeline server's webhook endpoint.
-- The pipeline server picks up the issue, runs the full 5-stage AI pipeline, and creates PRs with generated tests and code directly in the target repository.
+## 1. CI Validation Workflow (`.gitlab-ci.yml`)
 
-## Files to Copy
+Copy `Target Repo Workflow/.gitlab-ci.yml` into the root of your target GitLab repository as `.gitlab-ci.yml`.
 
 ```
-Target Repo Workflow/
-└── .github/
-    └── workflows/
-        └── notify-spec-driven-pipeline.yml   ← copy this to your target repo
+your-gitlab-target-repo/
+└── .gitlab-ci.yml
 ```
 
-Also copy (from the pipeline repo root):
+This workflow defines the stages executed by the orchestrator:
+- `test`: Unit tests execution (Jest or Pytest).
+- `lint`: ESLint quality checks.
+- `sast`: Semgrep static security testing.
+- `dependency-scan`: Trivy CVE vulnerability scan.
+- `test-coverage`: Code coverage verification.
+- `quality-gate`: SonarQube quality gate analysis (if configured).
 
-```
-.github/workflows/spec-driven-dev-ci.yml      ← copy this to your target repo
-```
+---
 
-The second file (`spec-driven-dev-ci.yml`) is the CI validation workflow that Stage 4 triggers to run ESLint, Semgrep, Trivy, and tests on the generated code.
+## 2. GitLab Webhook Configuration
 
-## Setup Steps
+In your target GitLab repository, go to **Settings → Webhooks → Add new webhook**:
 
-1. Copy `.github/workflows/notify-spec-driven-pipeline.yml` into the target repository.
-2. In the target repository, add two **Repository Secrets** (Settings → Secrets and variables → Actions):
-   - `SPEC_PIPELINE_SERVER_URL` — the public URL of your pipeline server (e.g. `https://pipeline.example.com`)
-   - `SPEC_PIPELINE_WEBHOOK_SECRET` — the same secret as `GITHUB_WEBHOOK_SECRET` in the pipeline's `.env`
-3. Copy `.github/workflows/spec-driven-dev-ci.yml` into the target repository.
-4. Label any issue with `SpecDrivenDev` to trigger the pipeline.
+1. **URL:** `https://your-pipeline-server.example.com/webhooks/gitlab`
+2. **Secret token:** Same as `GITLAB_WEBHOOK_SECRET` in `.env`.
+3. **Trigger events:**
+   - ✅ **Merge request events**
+   - ✅ **Comments**
+4. Click **Add webhook**.
 
-## Concurrency
+This allows human reviewers' MR approvals or `/approve` comments on GitLab to re-enqueue and advance the pipeline.
 
-The workflow uses `concurrency: cancel-in-progress: false` so that rapid issue creation is **queued, not dropped**. Combined with `MAX_CONCURRENT_TICKETS=1` on the server, only one pipeline run executes at a time.
+---
 
+## 3. JIRA Webhook Configuration
+
+In your JIRA instance, go to **Jira Settings → System → Webhooks → Create a Webhook**:
+
+1. **URL:** `https://your-pipeline-server.example.com/webhooks/jira`
+2. **Secret:** Same as `JIRA_WEBHOOK_SECRET` in `.env`.
+3. **Issue events:**
+   - ✅ **created**
+   - ✅ **updated**
+4. **JQL filter (optional):** `labels = "SpecDrivenDev"`
+5. Click **Save**.
+
+When an issue with the qualifying label `SpecDrivenDev` is created or labeled in JIRA, the webhook server enqueues the ticket for processing.

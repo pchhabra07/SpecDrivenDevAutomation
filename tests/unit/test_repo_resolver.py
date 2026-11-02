@@ -2,7 +2,7 @@
 Unit tests for orchestrator.repo_resolver (Phase 5).
 """
 
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 from orchestrator.repo_resolver import RepoResolver
 
 

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from orchestrator.jira_client import TicketData
+from orchestrator.models import TicketData
 from orchestrator.stages.stage1_context import _check_qualification, run
 
 

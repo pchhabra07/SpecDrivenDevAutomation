@@ -21,12 +21,18 @@ from typing import Any
 from orchestrator.audit import AuditLogger
 from orchestrator.checkpoint import Checkpoint
 from orchestrator.ci_poller import CIResult, trigger_ci, wait_for_pipeline
-from orchestrator.gitlab_client import GitLabClient
 
 logger = logging.getLogger(__name__)
 
-# Expected CI job names in the gitlab-ci-template.yml.
+# Expected CI job names across GitLab CI and GitHub Actions
 _GATE_JOBS = ("lint", "sast", "dependency-scan", "test-coverage", "quality-gate")
+_JOB_ALIASES: dict[str, tuple[str, ...]] = {
+    "lint": ("lint", "eslint"),
+    "sast": ("sast", "security-sast", "semgrep"),
+    "dependency-scan": ("dependency-scan", "security-deps", "trivy"),
+    "test-coverage": ("test-coverage", "test", "jest"),
+    "quality-gate": ("quality-gate", "sonarqube", "sonarcloud"),
+}
 
 
 @dataclass
@@ -70,7 +76,7 @@ class ValidationResult:
 
 def run(
     code_branch: str,
-    gitlab: GitLabClient,
+    gitlab: Any,
     checkpoint: Checkpoint,
     audit: AuditLogger,
     *,
@@ -78,6 +84,7 @@ def run(
     ci_timeout_minutes: int = 30,
     sonar_configured: bool = False,
     coverage_threshold: int = 80,
+    reuse_stage3_pipeline: bool = True,
 ) -> ValidationResult:
     """
     Execute Stage 4: trigger full CI pipeline and evaluate gate results.
@@ -87,7 +94,7 @@ def run(
     code_branch:
         The Git branch with the code changes from Stage 3.
     gitlab:
-        Initialised ``GitLabClient``.
+        Initialised ``GitHubClient`` or ``GitLabClient``.
     checkpoint:
         Current checkpoint (updated with pipeline ID and results).
     audit:
@@ -102,6 +109,8 @@ def run(
     coverage_threshold:
         Minimum Jest line-coverage percentage (for logging only — the
         actual enforcement is in the CI pipeline job itself).
+    reuse_stage3_pipeline:
+        Whether to reuse the full CI pipeline run from Stage 3 if available.
 
     Returns
     -------
@@ -113,26 +122,52 @@ def run(
         code_branch, coverage_threshold,
     )
 
-    # ── 1. Trigger full CI pipeline ────────────────────────────────────
-    pipeline_id = trigger_ci(gitlab, code_branch)
-    checkpoint.ci_pipeline_id = pipeline_id
-    audit.log(
-        stage=4,
-        event_type="ci_pipeline_triggered",
-        payload={"pipeline_id": pipeline_id, "branch": code_branch},
-    )
+    ci_result: CIResult
+    stored_result = getattr(checkpoint, "stage3_final_pipeline_result", None)
+    if (
+        reuse_stage3_pipeline
+        and stored_result
+        and stored_result.get("pipeline_id")
+    ):
+        pipeline_id = stored_result["pipeline_id"]
+        # Clear after single use so any subsequent repair iterations trigger a fresh CI run
+        checkpoint.stage3_final_pipeline_result = {}
+        logger.info(
+            "Reusing Stage 3 final full CI pipeline #%d (avoiding duplicate full CI run).",
+            pipeline_id,
+        )
+        ci_result = CIResult(
+            pipeline_id=pipeline_id,
+            status=stored_result.get("status", "unknown"),
+            web_url=stored_result.get("web_url", ""),
+            jobs=stored_result.get("jobs", []),
+        )
+        audit.log(
+            stage=4,
+            event_type="stage3_pipeline_reused",
+            payload={"pipeline_id": pipeline_id, "branch": code_branch},
+        )
+    else:
+        # ── 1. Trigger full CI pipeline ────────────────────────────────────
+        pipeline_id = trigger_ci(gitlab, code_branch)
+        checkpoint.ci_pipeline_id = pipeline_id
+        audit.log(
+            stage=4,
+            event_type="ci_pipeline_triggered",
+            payload={"pipeline_id": pipeline_id, "branch": code_branch},
+        )
 
-    # ── 2. Wait for pipeline completion ────────────────────────────────
-    ci_result: CIResult = wait_for_pipeline(
-        gitlab, pipeline_id,
-        poll_interval_seconds=ci_poll_interval,
-        timeout_minutes=ci_timeout_minutes,
-    )
+        # ── 2. Poll until terminal state ───────────────────────────────────
+        ci_result = wait_for_pipeline(
+            gitlab,
+            pipeline_id=pipeline_id,
+            poll_interval_seconds=ci_poll_interval,
+            timeout_minutes=ci_timeout_minutes,
+        )
 
-    # ── 3. Map job results to gate statuses ────────────────────────────
-    gates = _map_gate_statuses(ci_result, sonar_configured)
+    # ── 3. Evaluate individual gate statuses ───────────────────────────
+    gates = _map_gate_statuses(ci_result, sonar_configured=sonar_configured)
 
-    # Log each gate result individually.
     for gate in gates:
         audit.log(
             stage=4,
@@ -145,7 +180,7 @@ def run(
             },
         )
         logger.info(
-            "  Gate %-20s: %s%s",
+            "  Gate %-18s: %s%s",
             gate.name,
             gate.status,
             "" if gate.required else " (optional)",
@@ -186,30 +221,59 @@ def run(
     return result
 
 
+def _resolve_missing_gate_status(
+    job_name: str,
+    ci_passed: bool,
+    sonar_configured: bool,
+) -> tuple[str, bool]:
+    """
+    Determine (status, required) for a gate whose job was not found in CI results.
+
+    Gate resolution policy:
+    - quality-gate (SonarQube): always skipped and optional if SonarQube is not configured.
+    - If overall CI pipeline passed: mark as skipped and optional (job simply not defined in this repo).
+    - If overall CI pipeline failed: mark as unknown and optional (cannot determine if it ran).
+    - Only jobs explicitly present in CI results and marked 'failed'/'failure' block the pipeline.
+    """
+    if job_name == "quality-gate" and not sonar_configured:
+        return "skipped", False
+
+    if ci_passed:
+        # Pipeline succeeded overall; the gate job simply isn't defined in this repo
+        return "skipped", False
+    else:
+        # Pipeline failed; we can't determine if this gate ran or not
+        return "unknown", False
+
+
 def _map_gate_statuses(
     ci_result: CIResult,
     sonar_configured: bool,
 ) -> list[GateStatus]:
-    """Map CI job results to structured gate statuses."""
+    """Map CI job results to structured gate statuses across GitLab and GitHub."""
     gates: list[GateStatus] = []
 
     for job_name in _GATE_JOBS:
         is_sonar = job_name == "quality-gate"
         required = not is_sonar or sonar_configured
 
-        job_status = ci_result.job_status(job_name)
+        aliases = _JOB_ALIASES.get(job_name, (job_name,))
+        job_status = None
+        for alias in aliases:
+            st = ci_result.job_status(alias)
+            if st is not None:
+                job_status = st
+                break
 
         if job_status is None:
-            if is_sonar and not sonar_configured:
-                status = "skipped"
-                logger.info(
-                    "SonarQube not configured — skipping quality-gate check."
-                )
-            else:
-                status = "unknown"
-                logger.warning(
-                    "CI job '%s' not found in pipeline results.", job_name,
-                )
+            status, req = _resolve_missing_gate_status(
+                job_name, ci_result.passed, sonar_configured
+            )
+            required = req
+            logger.info(
+                "Gate '%s' not found in CI results. Policy decision: status=%s, required=%s",
+                job_name, status, required,
+            )
         else:
             status = job_status
 

@@ -81,3 +81,50 @@ class TestAuditLogger:
 
         entries = logger2.read_all()
         assert len(entries) == 2
+
+    def test_log_llm_interaction_jsonl(self):
+        """LLM interactions should be recorded to JSONL with full details."""
+        logger = AuditLogger("TRACE-1", self._tmpdir)
+        logger.log_llm_interaction(
+            stage=2,
+            prompt="Generate tests for dark mode",
+            response={"content": "// FILE: tests/test_ui.py\ndef test_ui(): pass"},
+            model="nvidia/nemotron-3-super-120b-a12b",
+            latency_seconds=12.5,
+            usage={"prompt_tokens": 1200, "completion_tokens": 300},
+            attached_files=["index.html", "style.css"],
+            call_purpose="Stage 2 Test Generation",
+        )
+        entries = logger.read_all()
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["event_type"] == "llm_interaction"
+        assert entry["stage"] == 2
+        payload = entry["payload"]
+        assert payload["model"] == "nvidia/nemotron-3-super-120b-a12b"
+        assert payload["latency_seconds"] == 12.5
+        assert payload["attached_files"] == ["index.html", "style.css"]
+        assert "tests/test_ui.py" in payload["response"]
+
+    def test_log_llm_interaction_markdown_trace(self):
+        """LLM interactions should be formatted into a human-readable markdown trace file."""
+        logger = AuditLogger("TRACE-2", self._tmpdir)
+        logger.log_llm_interaction(
+            stage=3,
+            prompt="Generate code for style.css",
+            response="// FILE: style.css\nbody { background: #000; }",
+            model="z-ai/glm-5.3",
+            latency_seconds=5.2,
+            usage={"prompt_tokens": 800, "completion_tokens": 150},
+            attached_files={"style.css": "body {}"},
+            call_purpose="Iteration 1 Code Generation",
+        )
+        assert logger.trace_filepath.exists()
+        content = logger.trace_filepath.read_text(encoding="utf-8")
+        assert "LLM Execution & Chat Trace — Ticket #TRACE-2" in content
+        assert "Turn 1: Stage 3 — Iteration 1 Code Generation" in content
+        assert "z-ai/glm-5.3" in content
+        assert "`style.css`" in content
+        assert "Generate code for style.css" in content
+        assert "body { background: #000; }" in content
+

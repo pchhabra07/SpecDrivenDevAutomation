@@ -13,7 +13,7 @@ from orchestrator.ci_poller import (
     trigger_ci,
     wait_for_pipeline,
 )
-from orchestrator.gitlab_client import PipelineResult
+from orchestrator.models import PipelineResult
 
 
 class TestTriggerCI:
